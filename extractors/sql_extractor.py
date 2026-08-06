@@ -18,7 +18,15 @@ from config.config import (
     DEFAULT_REPOSITORY_DATABASE,
     DEFAULT_SERVER,
     DEFAULT_SOURCE_DATABASE,
+    SQL_USERNAME,
+    SQL_PASSWORD,
 )
+
+if not SQL_USERNAME or not SQL_PASSWORD:
+    raise ValueError(
+        "SQL credentials are missing. "
+        "Set METADATA_SQL_USERNAME and METADATA_SQL_PASSWORD environment variables."
+    )
 
 
 LOG_FORMAT = '%(asctime)s %(levelname)s %(message)s'
@@ -33,7 +41,8 @@ def get_connection_string(driver: str, server: str, database: str) -> str:
         f"DRIVER={{{driver}}};"
         f"SERVER={server};"
         f"DATABASE={database};"
-        "Trusted_Connection=yes;"
+        f"UID={SQL_USERNAME};"
+        f"PWD={SQL_PASSWORD};"
         "TrustServerCertificate=yes;"
     )
 
