@@ -11,10 +11,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check Python version
+        run: |
+          python --version
+
+      - name: Create virtual environment
+        run: |
+          python -m venv .venv
+
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
       - name: Run SQL metadata extractor
         run: |
-          python extractors/sql_extractor.py
+          .\.venv\Scripts\python.exe extractors/sql_extractor.py
