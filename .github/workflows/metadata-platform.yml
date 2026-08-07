@@ -1,4 +1,4 @@
-name: Metadata Platform Extractor
+name: Metadata Platform Extractor Test
 
 on:
   workflow_dispatch:
@@ -8,21 +8,11 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Check Python version
         run: |
           python --version
 
-      - name: Create virtual environment
+      - name: Check current folder
         run: |
-          python -m venv .venv
-
-      - name: Install dependencies
-        run: |
-          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-
-      - name: Run SQL metadata extractor
-        run: |
-          .\.venv\Scripts\python.exe extractors/sql_extractor.py
+          pwd
+          dir
