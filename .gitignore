@@ -2,12 +2,15 @@
 __pycache__/
 *.pyc
 
-# Output files
-output/
-
 # Logs
 logs/
 
 # Virtual environments
 venv/
+.venv/
+
+# Environment / credentials
 .env
+
+# Temporary files
+*.tmp
