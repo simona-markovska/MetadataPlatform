@@ -14,3 +14,5 @@ venv/
 
 # Temporary files
 *.tmp
+# Generated metadata output
+output/*.csv

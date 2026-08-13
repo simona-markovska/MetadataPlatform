@@ -18,8 +18,6 @@ from config.config import (
     DEFAULT_REPOSITORY_DATABASE,
     DEFAULT_SERVER,
     DEFAULT_SOURCE_DATABASE,
-    SQL_USERNAME,
-    SQL_PASSWORD,
 )
 
 
@@ -27,14 +25,16 @@ from config.config import (
 # Configuration
 # ---------------------------------------------------------------------------
 
-if not SQL_USERNAME or not SQL_PASSWORD:
-    raise ValueError(
-        "SQL credentials are missing. "
-        "Set METADATA_SQL_USERNAME and METADATA_SQL_PASSWORD "
-        "environment variables."
-    )
-
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
+
+
+# Fabric Warehouse SQL endpoint
+FABRIC_SQL_SERVER = (
+    "j7mjaqg22d2ujb27llpciiyism-7jnw46tiqcde5cpv233ctk345u.datawarehouse.fabric.microsoft.com"
+)
+
+# Fabric Warehouse database name
+FABRIC_SQL_DATABASE = "MetadataRepository"
 
 
 # ---------------------------------------------------------------------------
@@ -45,27 +45,87 @@ def ensure_output_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def get_connection_string(
+# ---------------------------------------------------------------------------
+# SOURCE DATABASE CONNECTION
+# ---------------------------------------------------------------------------
+#
+# Source:
+#   Server   : AXM345
+#   Database : AdventureWorks2022
+#
+# Authentication:
+#   Windows Authentication
+#
+# This is the original source authentication.
+# ---------------------------------------------------------------------------
+
+def get_source_connection_string(
     driver: str,
     server: str,
     database: str,
 ) -> str:
+
     return (
         f"DRIVER={{{driver}}};"
         f"SERVER={server};"
         f"DATABASE={database};"
-        f"UID={SQL_USERNAME};"
-        f"PWD={SQL_PASSWORD};"
+        "Trusted_Connection=yes;"
         "TrustServerCertificate=yes;"
     )
 
 
-def connect_to_database(
+def connect_to_source(
     driver: str,
     server: str,
     database: str,
 ) -> pyodbc.Connection:
-    connection_string = get_connection_string(
+
+    connection_string = get_source_connection_string(
+        driver,
+        server,
+        database,
+    )
+
+    return pyodbc.connect(connection_string)
+
+
+# ---------------------------------------------------------------------------
+# FABRIC WAREHOUSE DESTINATION CONNECTION
+# ---------------------------------------------------------------------------
+#
+# Destination:
+#   Fabric Warehouse
+#
+# Authentication:
+#   Microsoft Entra Interactive Authentication
+#
+# This is the same authentication method that was successfully tested
+# in the standalone Fabric Metadata Repository test.
+# ---------------------------------------------------------------------------
+
+def get_fabric_connection_string(
+    driver: str,
+    server: str,
+    database: str,
+) -> str:
+
+    return (
+        f"DRIVER={{{driver}}};"
+        f"SERVER={server};"
+        f"DATABASE={database};"
+        "Authentication=ActiveDirectoryInteractive;"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+    )
+
+
+def connect_to_fabric_warehouse(
+    driver: str,
+    server: str,
+    database: str,
+) -> pyodbc.Connection:
+
+    connection_string = get_fabric_connection_string(
         driver,
         server,
         database,
@@ -146,6 +206,13 @@ def start_extraction_log(
 
     start_time = datetime.now()
 
+    # Fabric Warehouse does not support:
+    #
+    # OUTPUT INSERTED.ExtractionID
+    #
+    # Therefore, insert the record first and then retrieve
+    # the generated identity value.
+
     cursor.execute(
         """
         INSERT INTO MetadataExtractionLog
@@ -154,8 +221,22 @@ def start_extraction_log(
             StartTime,
             Status
         )
-        OUTPUT INSERTED.ExtractionID
         VALUES (?, ?, ?)
+        """,
+        database_id,
+        start_time,
+        "Running",
+    )
+
+    cursor.connection.commit()
+
+    cursor.execute(
+        """
+        SELECT MAX(ExtractionID)
+        FROM MetadataExtractionLog
+        WHERE DatabaseID = ?
+          AND StartTime = ?
+          AND Status = ?
         """,
         database_id,
         start_time,
@@ -172,8 +253,6 @@ def start_extraction_log(
         )
 
     extraction_id = int(identity_result[0])
-
-    cursor.connection.commit()
 
     return extraction_id
 
@@ -664,9 +743,9 @@ def load_relationships(
 
             continue
 
-        # ---------------------------------------------------------------
-        # Create or retrieve relationship
-        # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# Create or retrieve relationship
+# ---------------------------------------------------------------
 
         relationship_id = existing_relationships.get(
             constraint_name
@@ -677,15 +756,14 @@ def load_relationships(
             cursor.execute(
                 """
                 INSERT INTO MetadataRelationship
-                (
-                    DatabaseID,
+             (
+                 DatabaseID,
                     ParentTableID,
                     ParentColumnID,
                     ChildTableID,
                     ChildColumnID,
                     ConstraintName
                 )
-                OUTPUT INSERTED.RelationshipID
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 database_id,
@@ -696,7 +774,28 @@ def load_relationships(
                 constraint_name,
             )
 
-            relationship_id = cursor.fetchone()[0]
+            cursor.connection.commit()
+
+            cursor.execute(
+                """
+                SELECT MAX(RelationshipID)
+                FROM MetadataRelationship
+             WHERE DatabaseID = ?
+               AND ConstraintName = ?
+             """,
+             database_id,
+                constraint_name,
+            )
+
+            relationship_result = cursor.fetchone()
+
+            if not relationship_result or relationship_result[0] is None:
+                raise RuntimeError(
+                  f"Failed to retrieve RelationshipID for constraint "
+                 f"{constraint_name}."
+                )
+
+            relationship_id = int(relationship_result[0])
 
             existing_relationships[
                 constraint_name
@@ -704,9 +803,9 @@ def load_relationships(
 
             relationship_inserts += 1
 
-        # ---------------------------------------------------------------
-        # Column mapping
-        # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# Column mapping
+# ---------------------------------------------------------------
 
         parent_column = str(
             row["PARENT_COLUMN"]
@@ -773,21 +872,21 @@ def load_relationships(
             continue
 
         cursor.execute(
-        """
-        INSERT INTO MetadataRelationshipColumn
-        (
-            RelationshipID,
-            ParentColumnID,
-            ChildColumnID,
-            ColumnOrdinal
+            """
+            INSERT INTO MetadataRelationshipColumn
+            (
+                RelationshipID,
+                ParentColumnID,
+                ChildColumnID,
+                ColumnOrdinal
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            relationship_id,
+            parent_column_id,
+            child_column_id,
+            ordinal,
         )
-        VALUES (?, ?, ?, ?)
-        """,
-        relationship_id,
-        parent_column_id,
-        child_column_id,
-        ordinal,
-    )
 
         relationship_column_inserts += 1
 
@@ -908,14 +1007,14 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Extract metadata from SQL Server "
-            "and load it into a metadata repository."
+            "and load it into a Fabric Warehouse metadata repository."
         )
     )
 
     parser.add_argument(
         "--server",
         default=DEFAULT_SERVER,
-        help="SQL Server name",
+        help="SQL Server source name",
     )
 
     parser.add_argument(
@@ -927,7 +1026,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--repository-database",
         default=DEFAULT_REPOSITORY_DATABASE,
-        help="Metadata repository database name",
+        help="Fabric Warehouse database name",
     )
 
     parser.add_argument(
@@ -972,7 +1071,7 @@ def main() -> int:
         # Connect to source database
         # ---------------------------------------------------------------
 
-        source_conn = connect_to_database(
+        source_conn = connect_to_source(
             args.driver,
             args.server,
             args.source_database,
@@ -985,17 +1084,17 @@ def main() -> int:
         )
 
         # ---------------------------------------------------------------
-        # Connect to metadata repository
+        # Connect to Fabric Warehouse
         # ---------------------------------------------------------------
 
-        repo_conn = connect_to_database(
+        repo_conn = connect_to_fabric_warehouse(
             args.driver,
-            args.server,
+            FABRIC_SQL_SERVER,
             args.repository_database,
         )
 
         logging.info(
-            "Connected to repository database %s",
+            "Connected to Fabric Warehouse %s",
             args.repository_database,
         )
 
@@ -1140,12 +1239,17 @@ def main() -> int:
 
         if extraction_id and repo_conn:
 
-            update_extraction_log(
-                repo_conn.cursor(),
-                extraction_id,
-                "Failed",
-                error_message=str(exc),
-            )
+            try:
+                update_extraction_log(
+                    repo_conn.cursor(),
+                    extraction_id,
+                    "Failed",
+                    error_message=str(exc),
+                )
+            except Exception:
+                logging.exception(
+                    "Failed to update extraction log"
+                )
 
         return 1
 
@@ -1164,7 +1268,7 @@ def main() -> int:
             repo_conn.close()
 
             logging.info(
-                "Closed repository database connection"
+                "Closed Fabric Warehouse connection"
             )
 
 
