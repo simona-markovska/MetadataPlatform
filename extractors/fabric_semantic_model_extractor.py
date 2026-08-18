@@ -26,16 +26,12 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
 
 # ---------------------------------------------------------------------------
-# Fabric semantic model
+# Fabric workspace
 # ---------------------------------------------------------------------------
 
 WORKSPACE_ID = "7a6e5bfa-8068-4e86-89f5-d6f629ab7ced"
 
-SEMANTIC_MODEL_ID = (
-    "88d771ff-0ecd-4943-a0a7-748b83cbd2c3"
-)
-
-SEMANTIC_MODEL_NAME = "SM_AdventureWorks_Sales"
+WORKSPACE_NAME = "Metadata Intelligence Platform"
 
 
 # ---------------------------------------------------------------------------
@@ -665,9 +661,9 @@ class SemanticModelExtractor:
 
             stripped = line.strip()
 
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # Relationship
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             if stripped.startswith(
                 "relationship "
@@ -696,9 +692,9 @@ class SemanticModelExtractor:
                     "to_column": None,
                 }
 
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # From
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             elif stripped.startswith(
                 "fromColumn:"
@@ -724,9 +720,9 @@ class SemanticModelExtractor:
                         "from_column"
                     ] = column
 
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
             # To
-            # ---------------------------------------------------------------
+            # ----------------------------------------------------------------
 
             elif stripped.startswith(
                 "toColumn:"
@@ -1086,7 +1082,13 @@ def load_semantic_table_sources(
             TableName,
             TableType
         FROM dbo.MetadataSemanticTable
-        """
+        WHERE SemanticTableID IN ({})
+        """.format(
+            ",".join(
+                "?" for _ in semantic_table_lookup.values()
+            )
+        ),
+        *semantic_table_lookup.values(),
     )
 
     semantic_tables = cursor.fetchall()
@@ -1182,6 +1184,14 @@ def load_semantic_columns(
 
     semantic_column_lookup = {}
 
+    semantic_table_ids = list(
+        semantic_table_lookup.values()
+    )
+
+    if not semantic_table_ids:
+
+        return semantic_column_lookup
+
     cursor.execute(
         """
         SELECT
@@ -1189,7 +1199,13 @@ def load_semantic_columns(
             SemanticTableID,
             ColumnName
         FROM dbo.MetadataSemanticColumn
-        """
+        WHERE SemanticTableID IN ({})
+        """.format(
+            ",".join(
+                "?" for _ in semantic_table_ids
+            )
+        ),
+        *semantic_table_ids,
     )
 
     for (
@@ -1593,49 +1609,13 @@ def load_measure_dependencies(
     semantic_column_lookup,
     measures,
 ):
-    """
-    Extract semantic column dependencies from DAX measure expressions.
-
-    Example:
-
-        SUMX(
-            'Sales SalesOrderDetail',
-            'Sales SalesOrderDetail'[OrderQty]
-                *
-            'Sales SalesOrderDetail'[UnitPrice]
-        )
-
-    Creates:
-
-        Total Sales
-            -> Sales SalesOrderDetail[OrderQty]
-
-        Total Sales
-            -> Sales SalesOrderDetail[UnitPrice]
-
-    The dependency is stored using SemanticColumnID so that the
-    existing lineage chain can continue to the physical SQL source.
-    """
 
     inserted = 0
     deleted = 0
 
-    # -----------------------------------------------------------------------
-    # Match DAX references such as:
-    #
-    #     'Sales SalesOrderDetail'[OrderQty]
-    #
-    #     'Sales SalesOrderDetail'[UnitPrice]
-    #
-    # -----------------------------------------------------------------------
-
     column_reference_pattern = re.compile(
         r"'([^']+)'\s*\[\s*([^\]]+?)\s*\]"
     )
-
-    # -----------------------------------------------------------------------
-    # Process each measure
-    # -----------------------------------------------------------------------
 
     for measure in measures:
 
@@ -1646,10 +1626,6 @@ def load_measure_dependencies(
         dax_expression = measure[
             "expression"
         ]
-
-        # -------------------------------------------------------------------
-        # Find MeasureID
-        # -------------------------------------------------------------------
 
         cursor.execute(
             """
@@ -1678,13 +1654,6 @@ def load_measure_dependencies(
             result[0]
         )
 
-        # -------------------------------------------------------------------
-        # Delete existing dependencies for this measure.
-        #
-        # This makes repeated extraction safe and prevents stale
-        # dependencies when a DAX expression changes.
-        # -------------------------------------------------------------------
-
         cursor.execute(
             """
             DELETE FROM dbo.MetadataSemanticMeasureDependency
@@ -1697,10 +1666,6 @@ def load_measure_dependencies(
             cursor.rowcount,
             0,
         )
-
-        # -------------------------------------------------------------------
-        # Extract column references
-        # -------------------------------------------------------------------
 
         references = (
             column_reference_pattern.findall(
@@ -1717,19 +1682,11 @@ def load_measure_dependencies(
 
             continue
 
-        # -------------------------------------------------------------------
-        # Remove duplicates while preserving order
-        # -------------------------------------------------------------------
-
         unique_references = list(
             dict.fromkeys(
                 references
             )
         )
-
-        # -------------------------------------------------------------------
-        # Resolve semantic table and column IDs
-        # -------------------------------------------------------------------
 
         for (
             table_name,
@@ -1773,10 +1730,6 @@ def load_measure_dependencies(
                 )
 
                 continue
-
-            # ---------------------------------------------------------------
-            # Insert dependency
-            # ---------------------------------------------------------------
 
             cursor.execute(
                 """
@@ -2048,6 +2001,298 @@ def print_summary(
 
 
 # ===========================================================================
+# PROCESS ONE SEMANTIC MODEL
+# ===========================================================================
+
+
+def process_semantic_model(
+    client,
+    cursor,
+    database_id,
+    fabric_model_id,
+    semantic_model_name,
+):
+
+    # =======================================================================
+    # 1. RETRIEVE SEMANTIC MODEL DEFINITION
+    # =======================================================================
+
+    print()
+    print("=" * 70)
+    print(
+        f"SEMANTIC MODEL: {semantic_model_name}"
+    )
+    print("=" * 70)
+
+    print()
+    print(
+        "Retrieving semantic model definition..."
+    )
+
+    definition = (
+        client.get_semantic_model_definition(
+            WORKSPACE_ID,
+            fabric_model_id,
+        )
+    )
+
+    # =======================================================================
+    # 2. EXTRACT
+    # =======================================================================
+
+    extractor = SemanticModelExtractor(
+        definition,
+        workspace_id=WORKSPACE_ID,
+        semantic_model_id=fabric_model_id,
+        semantic_model_name=semantic_model_name,
+    )
+
+    tables = extractor.extract_tables()
+
+    columns = extractor.extract_columns()
+
+    measures = extractor.extract_measures()
+
+    relationships = (
+        extractor.extract_relationships()
+    )
+
+    # =======================================================================
+    # 3. PRINT CLASSIFICATION
+    # =======================================================================
+
+    print()
+    print("=" * 70)
+    print("TABLE CLASSIFICATION")
+    print("=" * 70)
+
+    for table in tables:
+
+        print(
+            f"- {table['table_name']}"
+            f" | Type: {table['table_type']}"
+        )
+
+    print_summary(
+        tables,
+        columns,
+        measures,
+        relationships,
+    )
+
+    # =======================================================================
+    # 4. SEMANTIC MODEL
+    # =======================================================================
+
+    print()
+    print(
+        "Loading semantic model..."
+    )
+
+    semantic_model_id = (
+        get_semantic_model_id(
+            cursor,
+            semantic_model_name,
+            fabric_model_id,
+        )
+    )
+
+    print(
+        f"SemanticModelID: "
+        f"{semantic_model_id}"
+    )
+
+    # =======================================================================
+    # 5. SEMANTIC TABLES
+    # =======================================================================
+
+    print()
+    print(
+        "Loading semantic tables..."
+    )
+
+    semantic_table_lookup = (
+        load_semantic_tables(
+            cursor,
+            semantic_model_id,
+            tables,
+        )
+    )
+
+    # =======================================================================
+    # 6. SOURCE TABLE LINKS
+    # =======================================================================
+
+    print(
+        "Linking semantic tables to SQL tables..."
+    )
+
+    source_table_lookup = (
+        build_source_table_lookup(
+            cursor,
+            database_id,
+        )
+    )
+
+    load_semantic_table_sources(
+        cursor,
+        semantic_table_lookup,
+        source_table_lookup,
+    )
+
+    # =======================================================================
+    # 7. SEMANTIC COLUMNS
+    # =======================================================================
+
+    print(
+        "Loading semantic columns..."
+    )
+
+    semantic_column_lookup = (
+        load_semantic_columns(
+            cursor,
+            semantic_table_lookup,
+            columns,
+        )
+    )
+
+    # =======================================================================
+    # 8. SOURCE COLUMN LINKS
+    # =======================================================================
+
+    print(
+        "Linking semantic columns to SQL columns..."
+    )
+
+    source_column_lookup = (
+        build_source_column_lookup(
+            cursor,
+            database_id,
+        )
+    )
+
+    load_semantic_column_sources(
+        cursor,
+        semantic_column_lookup,
+        semantic_table_lookup,
+        source_column_lookup,
+    )
+
+    # =======================================================================
+    # 9. MEASURES
+    # =======================================================================
+
+    print()
+    print(
+        "Loading measures and DAX definitions..."
+    )
+
+    load_measures(
+        cursor,
+        semantic_model_id,
+        tables,
+        semantic_table_lookup,
+        measures,
+    )
+
+    # =======================================================================
+    # 10. MEASURE DEPENDENCIES
+    # =======================================================================
+
+    print()
+    print(
+        "Loading measure dependencies..."
+    )
+
+    measure_dependencies_inserted = (
+        load_measure_dependencies(
+            cursor,
+            semantic_model_id,
+            semantic_table_lookup,
+            semantic_column_lookup,
+            measures,
+        )
+    )
+
+    print(
+        f"Measure dependencies loaded: "
+        f"{measure_dependencies_inserted}"
+    )
+
+    # =======================================================================
+    # 11. RELATIONSHIPS
+    # =======================================================================
+
+    print(
+        "Loading semantic relationships..."
+    )
+
+    load_semantic_relationships(
+        cursor,
+        semantic_model_id,
+        semantic_table_lookup,
+        semantic_column_lookup,
+        relationships,
+    )
+
+    # =======================================================================
+    # FINAL MODEL SUMMARY
+    # =======================================================================
+
+    print()
+    print("-" * 70)
+    print(
+        f"COMPLETED: {semantic_model_name}"
+    )
+    print("-" * 70)
+
+    print(
+        f"Fabric Semantic Model ID: {fabric_model_id}"
+    )
+
+    print(
+        f"Repository SemanticModelID: "
+        f"{semantic_model_id}"
+    )
+
+    print(
+        f"Tables extracted:   "
+        f"{len(tables)}"
+    )
+
+    print(
+        f"Columns extracted:  "
+        f"{len(columns)}"
+    )
+
+    print(
+        f"Measures extracted: "
+        f"{len(measures)}"
+    )
+
+    print(
+        f"Measure dependencies:"
+        f" {measure_dependencies_inserted}"
+    )
+
+    print(
+        f"Relationships:      "
+        f"{len(relationships)}"
+    )
+
+    return {
+        "name": semantic_model_name,
+        "fabric_model_id": fabric_model_id,
+        "semantic_model_id": semantic_model_id,
+        "tables": len(tables),
+        "columns": len(columns),
+        "measures": len(measures),
+        "dependencies": measure_dependencies_inserted,
+        "relationships": len(relationships),
+    }
+
+
+# ===========================================================================
 # MAIN
 # ===========================================================================
 
@@ -2068,69 +2313,52 @@ def main():
     try:
 
         # ===================================================================
-        # 1. RETRIEVE SEMANTIC MODEL DEFINITION
+        # 1. CREATE FABRIC CLIENT
         # ===================================================================
-
-        print()
-        print(
-            "Retrieving semantic model definition..."
-        )
 
         client = FabricClient()
 
-        definition = (
-            client.get_semantic_model_definition(
-                WORKSPACE_ID,
-                SEMANTIC_MODEL_ID,
-            )
-        )
-
         # ===================================================================
-        # 2. EXTRACT
-        # ===================================================================
-
-        extractor = SemanticModelExtractor(
-            definition,
-            workspace_id=WORKSPACE_ID,
-            semantic_model_id=SEMANTIC_MODEL_ID,
-            semantic_model_name=SEMANTIC_MODEL_NAME,
-        )
-
-        tables = extractor.extract_tables()
-
-        columns = extractor.extract_columns()
-
-        measures = extractor.extract_measures()
-
-        relationships = (
-            extractor.extract_relationships()
-        )
-
-        # ===================================================================
-        # 3. PRINT CLASSIFICATION
+        # 2. DISCOVER ALL SEMANTIC MODELS
         # ===================================================================
 
         print()
         print("=" * 70)
-        print("TABLE CLASSIFICATION")
+        print("DISCOVERING SEMANTIC MODELS")
         print("=" * 70)
 
-        for table in tables:
-
-            print(
-                f"- {table['table_name']}"
-                f" | Type: {table['table_type']}"
-            )
-
-        print_summary(
-            tables,
-            columns,
-            measures,
-            relationships,
+        semantic_models = client.get_items_by_type(
+            WORKSPACE_ID,
+            "SemanticModel",
         )
 
+        print(
+            f"Semantic models discovered: "
+            f"{len(semantic_models)}"
+        )
+
+        if not semantic_models:
+
+            raise RuntimeError(
+                "No semantic models were found in the "
+                "specified Fabric workspace."
+            )
+
+        print()
+
+        for index, model in enumerate(
+            semantic_models,
+            start=1,
+        ):
+
+            print(
+                f"  {index}. "
+                f"{model.get('displayName')} "
+                f"| ID: {model.get('id')}"
+            )
+
         # ===================================================================
-        # 4. CONNECT TO METADATA REPOSITORY
+        # 3. CONNECT TO METADATA REPOSITORY
         # ===================================================================
 
         print()
@@ -2161,7 +2389,7 @@ def main():
         )
 
         # ===================================================================
-        # 5. GET SOURCE DATABASE ID
+        # 4. GET SOURCE DATABASE ID
         # ===================================================================
 
         cursor.execute(
@@ -2195,162 +2423,74 @@ def main():
         )
 
         # ===================================================================
-        # 6. SEMANTIC MODEL
+        # 5. PROCESS EVERY SEMANTIC MODEL
         # ===================================================================
 
-        print()
-        print(
-            "Loading semantic model..."
-        )
+        results = []
+        successful = 0
+        failed = 0
 
-        semantic_model_id = (
-            get_semantic_model_id(
-                cursor,
-                SEMANTIC_MODEL_NAME,
-                SEMANTIC_MODEL_ID,
+        for model in semantic_models:
+
+            fabric_model_id = model.get("id")
+            semantic_model_name = model.get(
+                "displayName"
             )
-        )
 
-        print(
-            f"SemanticModelID: "
-            f"{semantic_model_id}"
-        )
+            if not fabric_model_id:
 
-        # ===================================================================
-        # 7. SEMANTIC TABLES
-        # ===================================================================
+                logging.warning(
+                    "Skipping semantic model with no ID: %s",
+                    model,
+                )
 
-        print()
-        print(
-            "Loading semantic tables..."
-        )
+                failed += 1
+                continue
 
-        semantic_table_lookup = (
-            load_semantic_tables(
-                cursor,
-                semantic_model_id,
-                tables,
-            )
-        )
+            if not semantic_model_name:
 
-        # ===================================================================
-        # 8. SOURCE TABLE LINKS
-        # ===================================================================
+                logging.warning(
+                    "Skipping semantic model with no display name: %s",
+                    model,
+                )
 
-        print(
-            "Linking semantic tables to SQL tables..."
-        )
+                failed += 1
+                continue
 
-        source_table_lookup = (
-            build_source_table_lookup(
-                cursor,
-                database_id,
-            )
-        )
+            try:
 
-        load_semantic_table_sources(
-            cursor,
-            semantic_table_lookup,
-            source_table_lookup,
-        )
+                result = process_semantic_model(
+                    client=client,
+                    cursor=cursor,
+                    database_id=database_id,
+                    fabric_model_id=fabric_model_id,
+                    semantic_model_name=semantic_model_name,
+                )
 
-        # ===================================================================
-        # 9. SEMANTIC COLUMNS
-        # ===================================================================
+                results.append(result)
 
-        print(
-            "Loading semantic columns..."
-        )
+                successful += 1
 
-        semantic_column_lookup = (
-            load_semantic_columns(
-                cursor,
-                semantic_table_lookup,
-                columns,
-            )
-        )
+            except Exception:
+
+                failed += 1
+
+                logging.exception(
+                    "Failed to extract semantic model: %s",
+                    semantic_model_name,
+                )
+
+                print()
+                print(
+                    f"ERROR extracting semantic model: "
+                    f"{semantic_model_name}"
+                )
+
+                # Continue with the remaining semantic models.
+                continue
 
         # ===================================================================
-        # 10. SOURCE COLUMN LINKS
-        # ===================================================================
-
-        print(
-            "Linking semantic columns to SQL columns..."
-        )
-
-        source_column_lookup = (
-            build_source_column_lookup(
-                cursor,
-                database_id,
-            )
-        )
-
-        load_semantic_column_sources(
-            cursor,
-            semantic_column_lookup,
-            semantic_table_lookup,
-            source_column_lookup,
-        )
-
-        # ===================================================================
-        # 11. MEASURES
-        # ===================================================================
-
-        print()
-        print(
-            "Loading measures and DAX definitions..."
-        )
-
-        load_measures(
-            cursor,
-            semantic_model_id,
-            tables,
-            semantic_table_lookup,
-            measures,
-        )
-
-        # ===================================================================
-        # 12. MEASURE DEPENDENCIES
-        # ===================================================================
-
-        print()
-        print(
-            "Loading measure dependencies..."
-        )
-
-        measure_dependencies_inserted = (
-            load_measure_dependencies(
-                cursor,
-                semantic_model_id,
-                semantic_table_lookup,
-                semantic_column_lookup,
-                measures,
-            )
-        )
-
-        print(
-            f"Measure dependencies loaded: "
-            f"{measure_dependencies_inserted}"
-        )
-
-        # ===================================================================
-        # 13. RELATIONSHIPS
-        # ===================================================================
-
-        print(
-            "Loading semantic relationships..."
-        )
-
-        load_semantic_relationships(
-            cursor,
-            semantic_model_id,
-            semantic_table_lookup,
-            semantic_column_lookup,
-            relationships,
-        )
-
-        # ===================================================================
-        # FINAL
+        # 6. FINAL SUMMARY
         # ===================================================================
 
         print()
@@ -2361,36 +2501,79 @@ def main():
         print("=" * 70)
 
         print(
-            f"Semantic model:     "
-            f"{SEMANTIC_MODEL_NAME}"
+            f"Semantic models discovered: "
+            f"{len(semantic_models)}"
         )
 
         print(
-            f"Tables extracted:   "
-            f"{len(tables)}"
+            f"Semantic models successful:  "
+            f"{successful}"
         )
 
         print(
-            f"Columns extracted:  "
-            f"{len(columns)}"
-        )
-
-        print(
-            f"Measures extracted: "
-            f"{len(measures)}"
-        )
-
-        print(
-            f"Measure dependencies:"
-            f" {measure_dependencies_inserted}"
-        )
-
-        print(
-            f"Relationships:      "
-            f"{len(relationships)}"
+            f"Semantic models failed:      "
+            f"{failed}"
         )
 
         print()
+
+        for result in results:
+
+            print(
+                f"Semantic model: "
+                f"{result['name']}"
+            )
+
+            print(
+                f"  Fabric Model ID: "
+                f"{result['fabric_model_id']}"
+            )
+
+            print(
+                f"  Repository ID:    "
+                f"{result['semantic_model_id']}"
+            )
+
+            print(
+                f"  Tables:           "
+                f"{result['tables']}"
+            )
+
+            print(
+                f"  Columns:          "
+                f"{result['columns']}"
+            )
+
+            print(
+                f"  Measures:         "
+                f"{result['measures']}"
+            )
+
+            print(
+                f"  Dependencies:     "
+                f"{result['dependencies']}"
+            )
+
+            print(
+                f"  Relationships:    "
+                f"{result['relationships']}"
+            )
+
+            print()
+
+        if failed > 0:
+
+            logging.warning(
+                "%d semantic model(s) failed extraction.",
+                failed,
+            )
+
+        if successful == 0:
+
+            raise RuntimeError(
+                "No semantic models were extracted successfully."
+            )
+
         print(
             "Metadata successfully loaded into "
             "MetadataRepository."
