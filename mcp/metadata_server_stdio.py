@@ -436,4 +436,4 @@ if __name__ == "__main__":
         "  - find_unused_measures"
     )
 
-    mcp.run(transport="streamable-http")
+    mcp.run()

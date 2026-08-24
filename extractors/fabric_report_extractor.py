@@ -28,6 +28,8 @@ from src.fabric.client import FabricClient
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
+logger = logging.getLogger(__name__)
+
 
 # ============================================================================
 # CONFIGURATION
@@ -55,15 +57,11 @@ FABRIC_SQL_DATABASE = "MetadataRepository"
 # ============================================================================
 
 OUTPUT_DIR = ROOT_DIR / "output"
-
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================================
-# UUID HELPERS
+# UUID
 # ============================================================================
 
 UUID_PATTERN = re.compile(
@@ -76,30 +74,203 @@ UUID_PATTERN = re.compile(
 
 
 def is_uuid(value):
-    """Return True when value looks like a GUID."""
-
     if value is None:
         return False
 
-    return bool(
-        UUID_PATTERN.match(
-            str(value)
-        )
+    return bool(UUID_PATTERN.match(str(value)))
+
+
+# ============================================================================
+# GENERIC HELPERS
+# ============================================================================
+
+def unique_preserve_order(values):
+    result = []
+
+    for value in values:
+        if value is None:
+            continue
+
+        value = str(value)
+
+        if value not in result:
+            result.append(value)
+
+    return result
+
+
+def safe_string(value):
+    if value is None:
+        return None
+
+    return str(value).strip()
+
+
+def normalize_name(value):
+    """
+    Normalize names for intelligent report/semantic-model matching.
+
+    Examples:
+
+        HR Overview
+        hr_overview
+        HR-Overview
+
+    all become:
+
+        hroverview
+    """
+
+    if value is None:
+        return ""
+
+    value = str(value).lower()
+
+    value = re.sub(
+        r"[^a-z0-9]+",
+        "",
+        value,
     )
+
+    return value
+
+
+def tokenize_name(value):
+    """
+    Convert a name into meaningful tokens.
+
+    Example:
+
+        SM_AdventureWorks_HR
+        -> {"sm", "adventureworks", "hr"}
+
+        HR Overview
+        -> {"hr", "overview"}
+    """
+
+    if value is None:
+        return set()
+
+    value = str(value)
+
+    tokens = re.findall(
+        r"[A-Za-z0-9]+",
+        value.lower(),
+    )
+
+    return {
+        token
+        for token in tokens
+        if token
+    }
+
+
+def meaningful_tokens(value):
+    """
+    Remove generic words that are not useful for identifying a model.
+    """
+
+    stop_words = {
+        "sm",
+        "semantic",
+        "model",
+        "dataset",
+        "report",
+        "overview",
+        "dashboard",
+        "powerbi",
+        "power",
+        "bi",
+    }
+
+    return {
+        token
+        for token in tokenize_name(value)
+        if token not in stop_words
+    }
+
+
+def name_similarity_score(
+    report_name,
+    model_name,
+):
+    """
+    Calculate a confidence score between a report and semantic model.
+
+    This is intentionally generic.
+
+    Example:
+
+        HR Overview
+        SM_AdventureWorks_HR
+
+    receives a strong score because both contain "hr".
+
+    Example:
+
+        Sales overview
+        SM_AdventureWorks_Sales
+
+    receives a strong score because both contain "sales".
+    """
+
+    report_tokens = meaningful_tokens(
+        report_name
+    )
+
+    model_tokens = meaningful_tokens(
+        model_name
+    )
+
+    if not report_tokens or not model_tokens:
+        return 0
+
+    intersection = (
+        report_tokens
+        & model_tokens
+    )
+
+    if not intersection:
+        return 0
+
+    score = 0
+
+    # Strong signal: exact meaningful token overlap.
+    score += len(intersection) * 100
+
+    # Additional signal if normalized names overlap.
+    normalized_report = normalize_name(
+        report_name
+    )
+
+    normalized_model = normalize_name(
+        model_name
+    )
+
+    for token in intersection:
+
+        normalized_token = normalize_name(
+            token
+        )
+
+        if normalized_token in normalized_report:
+            score += 25
+
+        if normalized_token in normalized_model:
+            score += 25
+
+    return score
 
 
 # ============================================================================
 # FABRIC WAREHOUSE CONNECTION
 # ============================================================================
 
-
 def get_fabric_connection_string(
     driver,
     server,
     database,
 ):
-    """Build the Fabric Warehouse ODBC connection string."""
-
     return (
         f"DRIVER={{{driver}}};"
         f"SERVER={server};"
@@ -115,15 +286,13 @@ def connect_to_fabric_warehouse(
     server,
     database,
 ):
-    """Open an interactive Microsoft Entra connection."""
-
     connection_string = get_fabric_connection_string(
         driver,
         server,
         database,
     )
 
-    logging.info(
+    logger.info(
         "Opening Microsoft Entra interactive authentication..."
     )
 
@@ -133,47 +302,25 @@ def connect_to_fabric_warehouse(
 
 
 # ============================================================================
-# REPORT DISCOVERY
+# WORKSPACE DISCOVERY
 # ============================================================================
 
+def normalize_workspace_items(response):
 
-def normalize_workspace_items(
-    response,
-):
-    """
-    Normalize Fabric workspace-items response.
-
-    Supports:
-        {"value": [...]}
-        {"items": [...]}
-        [...]
-    """
-
-    if isinstance(
-        response,
-        dict,
-    ):
+    if isinstance(response, dict):
 
         value = response.get(
             "value"
         )
 
-        if isinstance(
-            value,
-            list,
-        ):
-
+        if isinstance(value, list):
             return value
 
         items = response.get(
             "items"
         )
 
-        if isinstance(
-            items,
-            list,
-        ):
-
+        if isinstance(items, list):
             return items
 
         raise RuntimeError(
@@ -181,11 +328,7 @@ def normalize_workspace_items(
             f"Dictionary keys: {list(response.keys())}"
         )
 
-    if isinstance(
-        response,
-        list,
-    ):
-
+    if isinstance(response, list):
         return response
 
     raise RuntimeError(
@@ -198,8 +341,6 @@ def get_workspace_items(
     client,
     workspace_id,
 ):
-    """Retrieve and normalize all workspace items."""
-
     response = client.get_workspace_items(
         workspace_id
     )
@@ -211,31 +352,16 @@ def get_workspace_items(
     return [
         item
         for item in items
-        if isinstance(
-            item,
-            dict,
-        )
+        if isinstance(item, dict)
     ]
 
 
-def discover_reports(
-    client,
-    workspace_id,
+def discover_reports_from_items(
+    workspace_items,
 ):
-    """Discover all Fabric reports in the workspace."""
-
-    logging.info(
-        "Discovering reports automatically..."
-    )
-
-    items = get_workspace_items(
-        client,
-        workspace_id,
-    )
-
     reports = []
 
-    for item in items:
+    for item in workspace_items:
 
         item_type = (
             item.get("type")
@@ -251,23 +377,19 @@ def discover_reports(
             or item.get("reportId")
         )
 
+        if not report_id:
+            logger.warning(
+                "Skipping report without ID: %s",
+                item,
+            )
+            continue
+
         report_name = (
             item.get("displayName")
             or item.get("name")
             or item.get("reportName")
+            or str(report_id)
         )
-
-        if not report_id:
-
-            logging.warning(
-                "Skipping report without ID: %s",
-                item,
-            )
-
-            continue
-
-        if not report_name:
-            report_name = str(report_id)
 
         reports.append(
             {
@@ -282,7 +404,7 @@ def discover_reports(
         key=lambda x: x["name"].lower()
     )
 
-    logging.info(
+    logger.info(
         "Reports discovered: %d",
         len(reports),
     )
@@ -290,212 +412,10 @@ def discover_reports(
     return reports
 
 
-# ============================================================================
-# SEMANTIC MODEL DISCOVERY
-# ============================================================================
-
-
-def collect_semantic_model_candidates(
-    value,
-    candidates=None,
-    parent_key="",
-):
-    """
-    Recursively search an object for values stored under keys that
-    look related to semantic models, datasets, or models.
-    """
-
-    if candidates is None:
-        candidates = []
-
-    if isinstance(
-        value,
-        dict,
-    ):
-
-        for key, child in value.items():
-
-            key_text = str(
-                key
-            ).lower()
-
-            semantic_key = (
-                "semantic" in key_text
-                and "model" in key_text
-            )
-
-            dataset_key = (
-                "dataset" in key_text
-                and (
-                    "id" in key_text
-                    or "model" in key_text
-                )
-            )
-
-            model_key = (
-                key_text in {
-                    "modelid",
-                    "semanticmodelid",
-                    "datasetid",
-                    "dataset_id",
-                }
-            )
-
-            if (
-                semantic_key
-                or dataset_key
-                or model_key
-            ):
-
-                if isinstance(
-                    child,
-                    str,
-                ) and is_uuid(child):
-
-                    candidates.append(
-                        child
-                    )
-
-                elif isinstance(
-                    child,
-                    dict,
-                ):
-
-                    for candidate_key in (
-                        "id",
-                        "modelId",
-                        "modelID",
-                        "semanticModelId",
-                        "semanticModelID",
-                        "datasetId",
-                        "datasetID",
-                    ):
-
-                        candidate = child.get(
-                            candidate_key
-                        )
-
-                        if is_uuid(
-                            candidate
-                        ):
-
-                            candidates.append(
-                                str(candidate)
-                            )
-
-            collect_semantic_model_candidates(
-                child,
-                candidates,
-                key_text,
-            )
-
-    elif isinstance(
-        value,
-        list,
-    ):
-
-        for child in value:
-
-            collect_semantic_model_candidates(
-                child,
-                candidates,
-                parent_key,
-            )
-
-    return candidates
-
-
-def extract_report_semantic_model_id(
-    definition,
-):
-    """
-    Try to identify the semantic model Fabric ID from the
-    report definition.
-    """
-
-    candidates = []
-
-    for part in get_definition_parts(
-        definition
-    ):
-
-        path = part.get(
-            "path",
-            "",
-        )
-
-        # report.json is the most relevant location
-        if path == "definition/report.json":
-
-            data = parse_json_part(
-                part
-            )
-
-            if data:
-
-                candidates.extend(
-                    collect_semantic_model_candidates(
-                        data
-                    )
-                )
-
-    # Remove duplicates while preserving order
-    unique_candidates = []
-
-    for candidate in candidates:
-
-        if candidate not in unique_candidates:
-
-            unique_candidates.append(
-                candidate
-            )
-
-    if unique_candidates:
-
-        logging.info(
-            "Semantic model candidate found in report definition: %s",
-            unique_candidates[0],
-        )
-
-        return unique_candidates[0]
-
-    return None
-
-
-def extract_semantic_model_id_from_workspace_item(
-    report_item,
-):
-    """
-    Try to identify a semantic model ID directly from the
-    workspace item representing the report.
-    """
-
-    if not isinstance(
-        report_item,
-        dict,
-    ):
-
-        return None
-
-    candidates = collect_semantic_model_candidates(
-        report_item
-    )
-
-    for candidate in candidates:
-
-        if is_uuid(candidate):
-
-            return str(candidate)
-
-    return None
-
-
 def discover_semantic_models(
     workspace_items,
 ):
-    """Return all SemanticModel items in the workspace."""
-
-    semantic_models = []
+    models = []
 
     for item in workspace_items:
 
@@ -513,216 +433,107 @@ def discover_semantic_models(
             or item.get("semanticModelId")
         )
 
+        if not model_id:
+            continue
+
         model_name = (
             item.get("displayName")
             or item.get("name")
             or item.get("modelName")
+            or str(model_id)
         )
 
-        if not model_id:
-            continue
-
-        semantic_models.append(
+        models.append(
             {
                 "id": str(model_id),
-                "name": (
-                    str(model_name)
-                    if model_name
-                    else str(model_id)
-                ),
+                "name": str(model_name),
                 "raw": item,
             }
         )
 
-    return semantic_models
+    models.sort(
+        key=lambda x: x["name"].lower()
+    )
+
+    return models
 
 
-def resolve_semantic_model_for_report(
-    client,
-    workspace_id,
-    report,
-    definition,
-    cursor,
+def print_workspace_inventory(
+    workspace_items,
 ):
-    """
-    Resolve the Fabric semantic model connected to a report.
-
-    Resolution order:
-
-    1. Report definition
-    2. Report workspace item metadata
-    3. Existing repository semantic model matching the
-       discovered Fabric semantic model
-    4. If the workspace contains exactly one semantic model,
-       use it as a safe fallback
-
-    This function deliberately does NOT depend on MetadataReport
-    already existing.
-    """
-
-    # ------------------------------------------------------------------------
-    # 1. Report definition
-    # ------------------------------------------------------------------------
-
-    fabric_model_id = (
-        extract_report_semantic_model_id(
-            definition
-        )
+    logger.info(
+        "Workspace inventory:"
     )
 
-    if fabric_model_id:
-
-        logging.info(
-            "Semantic model discovered from report definition: %s",
-            fabric_model_id,
-        )
-
-        return fabric_model_id
-
-    logging.warning(
-        "Semantic model was not identified directly "
-        "from the report definition."
-    )
-
-    # ------------------------------------------------------------------------
-    # 2. Workspace item metadata
-    # ------------------------------------------------------------------------
-
-    workspace_items = get_workspace_items(
-        client,
-        workspace_id,
-    )
-
-    report_item = None
+    item_types = {}
 
     for item in workspace_items:
 
-        item_id = (
-            item.get("id")
-            or item.get("itemId")
-            or item.get("reportId")
+        item_type = item.get(
+            "type",
+            "Unknown",
         )
 
-        if str(item_id) == str(
-            report["id"]
-        ):
-
-            report_item = item
-
-            break
-
-    if report_item:
-
-        fabric_model_id = (
-            extract_semantic_model_id_from_workspace_item(
-                report_item
-            )
+        item_types.setdefault(
+            item_type,
+            0,
         )
 
-        if fabric_model_id:
+        item_types[item_type] += 1
 
-            logging.info(
-                "Semantic model discovered from "
-                "report workspace metadata: %s",
-                fabric_model_id,
-            )
-
-            return fabric_model_id
-
-    # ------------------------------------------------------------------------
-    # 3. Discover semantic models in workspace
-    # ------------------------------------------------------------------------
-
-    semantic_models = discover_semantic_models(
-        workspace_items
-    )
-
-    logging.info(
-        "Semantic models discovered in workspace: %d",
-        len(semantic_models),
-    )
-
-    # ------------------------------------------------------------------------
-    # 4. Match repository model names where possible
-    # ------------------------------------------------------------------------
-
-    if semantic_models:
-
-        for model in semantic_models:
-
-            cursor.execute(
-                """
-                SELECT
-                    SemanticModelID,
-                    ModelName,
-                    FabricModelID
-                FROM dbo.MetadataSemanticModel
-                WHERE FabricModelID = ?
-                """,
-                model["id"],
-            )
-
-            result = cursor.fetchone()
-
-            if result:
-
-                logging.info(
-                    "Semantic model matched to repository: "
-                    "%s (%s)",
-                    model["name"],
-                    model["id"],
-                )
-
-                return str(
-                    model["id"]
-                )
-
-    # ------------------------------------------------------------------------
-    # 5. Safe single-model fallback
-    # ------------------------------------------------------------------------
-
-    if len(
-        semantic_models
-    ) == 1:
-
-        model = semantic_models[0]
-
-        logging.warning(
-            "Using the only semantic model in the workspace "
-            "as the report's semantic model: %s (%s)",
-            model["name"],
-            model["id"],
+    for item_type, count in sorted(
+        item_types.items()
+    ):
+        logger.info(
+            "  %s=%d",
+            item_type,
+            count,
         )
-
-        return model["id"]
-
-    # ------------------------------------------------------------------------
-    # 6. Could not resolve
-    # ------------------------------------------------------------------------
-
-    available_models = ", ".join(
-        f"{model['name']} [{model['id']}]"
-        for model in semantic_models
-    )
-
-    raise RuntimeError(
-        "Could not determine the semantic model for report "
-        f"'{report['name']}'. "
-        f"Semantic models available in workspace: "
-        f"{available_models or 'none'}"
-    )
 
 
 # ============================================================================
-# REPORT DEFINITION HELPERS
+# DEFINITION HELPERS
 # ============================================================================
+
+def get_definition_parts(
+    definition,
+):
+    if not isinstance(
+        definition,
+        dict,
+    ):
+        raise RuntimeError(
+            "Report definition is not a dictionary."
+        )
+
+    definition_object = definition.get(
+        "definition",
+        {},
+    )
+
+    if not isinstance(
+        definition_object,
+        dict,
+    ):
+        return []
+
+    parts = definition_object.get(
+        "parts",
+        [],
+    )
+
+    if not isinstance(
+        parts,
+        list,
+    ):
+        return []
+
+    return parts
 
 
 def decode_definition_part(
     part,
 ):
-    """Decode an InlineBase64 Fabric definition part."""
-
     payload = part.get(
         "payload"
     )
@@ -750,58 +561,37 @@ def decode_definition_part(
 
     except Exception:
 
-        logging.exception(
-            "Failed to decode report definition part."
+        logger.exception(
+            "Could not decode definition part: %s",
+            part.get("path"),
         )
 
         return ""
 
 
-def get_definition_parts(
-    definition,
+def parse_json_part(
+    part,
 ):
-    """Return report-definition parts."""
-
-    if not isinstance(
-        definition,
-        dict,
-    ):
-
-        raise RuntimeError(
-            "Report definition is not a dictionary."
-        )
-
-    definition_object = definition.get(
-        "definition",
-        {},
+    content = decode_definition_part(
+        part
     )
 
-    if isinstance(
-        definition_object,
-        dict,
-    ):
+    if not content:
+        return None
 
-        parts = definition_object.get(
-            "parts",
-            [],
+    try:
+        return json.loads(
+            content
         )
 
-        if isinstance(
-            parts,
-            list,
-        ):
-
-            return parts
-
-    return []
+    except json.JSONDecodeError:
+        return None
 
 
 def save_report_definition(
     report_name,
     definition,
 ):
-    """Save the raw report definition for troubleshooting."""
-
     safe_name = re.sub(
         r"[^A-Za-z0-9_.-]+",
         "_",
@@ -828,78 +618,744 @@ def save_report_definition(
                 ensure_ascii=False,
             )
 
-        logging.info(
+        logger.info(
             "Saved report definition: %s",
             output_file,
         )
 
     except Exception:
 
-        logging.exception(
+        logger.exception(
             "Could not save report definition."
         )
 
 
-def parse_json_part(
-    part,
-):
-    """Decode a definition part and parse it as JSON."""
+# ============================================================================
+# SEMANTIC MODEL DISCOVERY FROM REPORT
+# ============================================================================
 
-    content = decode_definition_part(
-        part
+SEMANTIC_ID_KEYS = {
+    "semanticmodelid",
+    "semanticmodel_id",
+    "semanticmodelguid",
+    "datasetid",
+    "dataset_id",
+    "datasetguid",
+    "modelid",
+    "model_id",
+    "modelguid",
+}
+
+
+def collect_ids_from_key(
+    key,
+    value,
+    candidates,
+):
+
+    key_normalized = re.sub(
+        r"[^a-z0-9]",
+        "",
+        str(key).lower(),
     )
 
-    if not content:
-        return None
+    is_model_key = (
+        key_normalized in SEMANTIC_ID_KEYS
+        or (
+            "semanticmodel" in key_normalized
+            and "id" in key_normalized
+        )
+        or (
+            "dataset" in key_normalized
+            and "id" in key_normalized
+        )
+    )
 
-    try:
+    if not is_model_key:
+        return
 
-        return json.loads(
-            content
+    if (
+        isinstance(value, str)
+        and is_uuid(value)
+    ):
+
+        candidates.append(
+            value
         )
 
-    except json.JSONDecodeError:
+    elif isinstance(
+        value,
+        dict,
+    ):
 
-        logging.debug(
-            "Definition part is not JSON: %s",
-            part.get("path"),
+        for nested_key in (
+            "id",
+            "modelId",
+            "modelID",
+            "semanticModelId",
+            "semanticModelID",
+            "datasetId",
+            "datasetID",
+        ):
+
+            nested_value = value.get(
+                nested_key
+            )
+
+            if is_uuid(
+                nested_value
+            ):
+
+                candidates.append(
+                    str(nested_value)
+                )
+
+
+def collect_semantic_model_candidates(
+    value,
+    candidates=None,
+):
+
+    if candidates is None:
+        candidates = []
+
+    if isinstance(
+        value,
+        dict,
+    ):
+
+        for key, child in value.items():
+
+            collect_ids_from_key(
+                key,
+                child,
+                candidates,
+            )
+
+            collect_semantic_model_candidates(
+                child,
+                candidates,
+            )
+
+    elif isinstance(
+        value,
+        list,
+    ):
+
+        for child in value:
+
+            collect_semantic_model_candidates(
+                child,
+                candidates,
+            )
+
+    return candidates
+
+
+def extract_report_semantic_model_ids(
+    definition,
+):
+
+    candidates = []
+
+    for part in get_definition_parts(
+        definition
+    ):
+
+        data = parse_json_part(
+            part
         )
 
-        return None
+        if data is None:
+            continue
+
+        candidates.extend(
+            collect_semantic_model_candidates(
+                data
+            )
+        )
+
+    return unique_preserve_order(
+        candidates
+    )
+
+
+def extract_semantic_model_ids_from_workspace_item(
+    report_item,
+):
+
+    if not isinstance(
+        report_item,
+        dict,
+    ):
+        return []
+
+    candidates = (
+        collect_semantic_model_candidates(
+            report_item
+        )
+    )
+
+    return unique_preserve_order(
+        [
+            candidate
+            for candidate in candidates
+            if is_uuid(candidate)
+        ]
+    )
 
 
 # ============================================================================
-# REPORT METADATA EXTRACTION
+# REPOSITORY LOOKUPS
 # ============================================================================
 
+def get_repository_semantic_models(
+    cursor,
+):
+
+    cursor.execute(
+        """
+        SELECT
+            SemanticModelID,
+            ModelName,
+            FabricModelID
+        FROM dbo.MetadataSemanticModel
+        """
+    )
+
+    models = []
+
+    for row in cursor.fetchall():
+
+        repository_id = row[0]
+        model_name = row[1]
+        fabric_model_id = row[2]
+
+        models.append(
+            {
+                "repository_id": int(
+                    repository_id
+                ),
+                "name": (
+                    str(model_name)
+                    if model_name is not None
+                    else ""
+                ),
+                "fabric_id": (
+                    str(fabric_model_id)
+                    if fabric_model_id is not None
+                    else None
+                ),
+            }
+        )
+
+    return models
+
+
+def get_repository_semantic_model_id(
+    cursor,
+    fabric_model_id,
+):
+
+    cursor.execute(
+        """
+        SELECT SemanticModelID
+        FROM dbo.MetadataSemanticModel
+        WHERE FabricModelID = ?
+        """,
+        fabric_model_id,
+    )
+
+    result = cursor.fetchone()
+
+    if not result:
+
+        raise RuntimeError(
+            "Fabric semantic model exists in Fabric but was not "
+            "found in MetadataSemanticModel. "
+            f"FabricModelID: {fabric_model_id}"
+        )
+
+    return int(
+        result[0]
+    )
+
+
+# ============================================================================
+# INTELLIGENT SEMANTIC MODEL RESOLUTION
+# ============================================================================
+
+def score_semantic_model_candidate(
+    report,
+    model,
+    repository_model=None,
+):
+    """
+    Score a semantic-model candidate.
+
+    This deliberately avoids hard-coded mappings.
+
+    Signals:
+
+        1. Report name ↔ Fabric model name
+        2. Report name ↔ repository model name
+        3. Shared meaningful tokens
+        4. Exact normalized match
+    """
+
+    report_name = report["name"]
+
+    fabric_model_name = model.get(
+        "name",
+        "",
+    )
+
+    score = name_similarity_score(
+        report_name,
+        fabric_model_name,
+    )
+
+    reasons = []
+
+    if score > 0:
+
+        shared_tokens = (
+            meaningful_tokens(
+                report_name
+            )
+            & meaningful_tokens(
+                fabric_model_name
+            )
+        )
+
+        if shared_tokens:
+
+            reasons.append(
+                "shared tokens: "
+                + ", ".join(
+                    sorted(shared_tokens)
+                )
+            )
+
+    if repository_model:
+
+        repository_name = (
+            repository_model.get(
+                "name"
+            )
+            or ""
+        )
+
+        repository_score = (
+            name_similarity_score(
+                report_name,
+                repository_name,
+            )
+        )
+
+        if repository_score > 0:
+
+            score += repository_score
+
+            reasons.append(
+                "repository model name match"
+            )
+
+    normalized_report = normalize_name(
+        report_name
+    )
+
+    normalized_model = normalize_name(
+        fabric_model_name
+    )
+
+    if (
+        normalized_report
+        and normalized_model
+        and (
+            normalized_report
+            == normalized_model
+        )
+    ):
+
+        score += 500
+
+        reasons.append(
+            "exact normalized name match"
+        )
+
+    return score, reasons
+
+
+def resolve_semantic_model_for_report(
+    client,
+    workspace_id,
+    report,
+    definition,
+    cursor,
+    workspace_items,
+):
+    """
+    Resolve the semantic model connected to a report.
+
+    Resolution order:
+
+        1. Explicit semantic-model ID in report definition
+        2. Explicit semantic-model ID in workspace report metadata
+        3. Repository cross-reference
+        4. Intelligent report/model name scoring
+        5. Single-model fallback
+
+    The important improvement is step 4.
+
+    Previously:
+
+        HR Overview
+        Sales overview
+
+    could not be associated with:
+
+        SM_AdventureWorks_HR
+        SM_AdventureWorks_Sales
+
+    because Fabric's report definition did not contain an explicit
+    semantic model ID.
+
+    The new resolver uses the names as evidence instead.
+    """
+
+    report_name = report["name"]
+
+    semantic_models = discover_semantic_models(
+        workspace_items
+    )
+
+    workspace_model_ids = {
+        model["id"]
+        for model in semantic_models
+    }
+
+    logger.info(
+        "Semantic models discovered in workspace: %d",
+        len(semantic_models),
+    )
+
+    # ========================================================================
+    # 1. EXPLICIT ID FROM REPORT DEFINITION
+    # ========================================================================
+
+    definition_candidates = (
+        extract_report_semantic_model_ids(
+            definition
+        )
+    )
+
+    logger.info(
+        "Semantic model candidates found in report definition: %s",
+        definition_candidates or "none",
+    )
+
+    valid_definition_candidates = [
+        candidate
+        for candidate in definition_candidates
+        if candidate in workspace_model_ids
+    ]
+
+    if len(valid_definition_candidates) == 1:
+
+        selected = (
+            valid_definition_candidates[0]
+        )
+
+        selected_model = next(
+            model
+            for model in semantic_models
+            if model["id"] == selected
+        )
+
+        logger.info(
+            "Semantic model resolved from explicit report definition: "
+            "%s [%s]",
+            selected_model["name"],
+            selected,
+        )
+
+        return selected
+
+    if len(valid_definition_candidates) > 1:
+
+        logger.warning(
+            "Multiple explicit semantic model candidates were found "
+            "in report definition. Continuing with scoring."
+        )
+
+    # ========================================================================
+    # 2. EXPLICIT ID FROM REPORT WORKSPACE ITEM
+    # ========================================================================
+
+    report_item = report.get(
+        "raw"
+    )
+
+    workspace_candidates = (
+        extract_semantic_model_ids_from_workspace_item(
+            report_item
+        )
+    )
+
+    logger.info(
+        "Semantic model candidates found in report workspace metadata: %s",
+        workspace_candidates or "none",
+    )
+
+    valid_workspace_candidates = [
+        candidate
+        for candidate in workspace_candidates
+        if candidate in workspace_model_ids
+    ]
+
+    if len(valid_workspace_candidates) == 1:
+
+        selected = (
+            valid_workspace_candidates[0]
+        )
+
+        selected_model = next(
+            model
+            for model in semantic_models
+            if model["id"] == selected
+        )
+
+        logger.info(
+            "Semantic model resolved from report workspace metadata: "
+            "%s [%s]",
+            selected_model["name"],
+            selected,
+        )
+
+        return selected
+
+    if len(valid_workspace_candidates) > 1:
+
+        logger.warning(
+            "Multiple semantic model candidates were found in "
+            "report workspace metadata. Continuing with scoring."
+        )
+
+    # ========================================================================
+    # 3. REPOSITORY CROSS-REFERENCE
+    # ========================================================================
+
+    repository_models = (
+        get_repository_semantic_models(
+            cursor
+        )
+    )
+
+    repository_by_fabric_id = {
+        model["fabric_id"]: model
+        for model in repository_models
+        if model["fabric_id"]
+    }
+
+    # Explicit definition candidates that are present in repository.
+    repository_definition_matches = [
+        candidate
+        for candidate in definition_candidates
+        if candidate in repository_by_fabric_id
+    ]
+
+    if len(repository_definition_matches) == 1:
+
+        selected = (
+            repository_definition_matches[0]
+        )
+
+        logger.info(
+            "Semantic model resolved using repository cross-reference: "
+            "%s",
+            selected,
+        )
+
+        return selected
+
+    # ========================================================================
+    # 4. INTELLIGENT NAME MATCHING
+    # ========================================================================
+
+    logger.info(
+        "Attempting intelligent report-to-semantic-model matching..."
+    )
+
+    scored_candidates = []
+
+    for model in semantic_models:
+
+        repository_model = (
+            repository_by_fabric_id.get(
+                model["id"]
+            )
+        )
+
+        score, reasons = (
+            score_semantic_model_candidate(
+                report,
+                model,
+                repository_model,
+            )
+        )
+
+        scored_candidates.append(
+            {
+                "model": model,
+                "score": score,
+                "reasons": reasons,
+            }
+        )
+
+    scored_candidates.sort(
+        key=lambda candidate: candidate["score"],
+        reverse=True,
+    )
+
+    logger.info(
+        "Semantic model candidate scores for report '%s':",
+        report_name,
+    )
+
+    for candidate in scored_candidates:
+
+        model = candidate["model"]
+
+        logger.info(
+            "  %s [%s] -> score=%d | %s",
+            model["name"],
+            model["id"],
+            candidate["score"],
+            (
+                ", ".join(
+                    candidate["reasons"]
+                )
+                if candidate["reasons"]
+                else "no name evidence"
+            ),
+        )
+
+    # ========================================================================
+    # 5. SELECT STRONG UNIQUE MATCH
+    # ========================================================================
+
+    if scored_candidates:
+
+        best = scored_candidates[0]
+
+        if best["score"] > 0:
+
+            if len(scored_candidates) == 1:
+
+                logger.info(
+                    "Semantic model resolved by name scoring: "
+                    "%s [%s]",
+                    best["model"]["name"],
+                    best["model"]["id"],
+                )
+
+                return best["model"]["id"]
+
+            second = scored_candidates[1]
+
+            score_difference = (
+                best["score"]
+                - second["score"]
+            )
+
+            # Require a meaningful lead over the second candidate.
+            #
+            # This prevents:
+            #
+            # Report: Finance Overview
+            #
+            # Model 1: Finance Sales
+            # Model 2: Finance HR
+            #
+            # from being selected merely because both contain "finance".
+            if (
+                best["score"] >= 100
+                and score_difference >= 50
+            ):
+
+                logger.info(
+                    "Semantic model resolved by intelligent matching: "
+                    "%s [%s]",
+                    best["model"]["name"],
+                    best["model"]["id"],
+                )
+
+                logger.info(
+                    "Match confidence: score=%d, second=%d, "
+                    "difference=%d",
+                    best["score"],
+                    second["score"],
+                    score_difference,
+                )
+
+                return best["model"]["id"]
+
+            logger.warning(
+                "Name matching produced an ambiguous result. "
+                "Best candidate=%s score=%d, "
+                "second candidate=%s score=%d.",
+                best["model"]["name"],
+                best["score"],
+                second["model"]["name"],
+                second["score"],
+            )
+
+    # ========================================================================
+    # 6. SINGLE MODEL FALLBACK
+    # ========================================================================
+
+    if len(semantic_models) == 1:
+
+        model = semantic_models[0]
+
+        logger.warning(
+            "Only one semantic model exists in the workspace. "
+            "Using it for report '%s': %s (%s)",
+            report_name,
+            model["name"],
+            model["id"],
+        )
+
+        return model["id"]
+
+    # ========================================================================
+    # 7. FAIL SAFELY
+    # ========================================================================
+
+    available_models = ", ".join(
+        f"{model['name']} [{model['id']}]"
+        for model in semantic_models
+    )
+
+    raise RuntimeError(
+        "Could not safely determine the semantic model for "
+        f"report '{report_name}'. "
+        f"Available semantic models: "
+        f"{available_models or 'none'}"
+    )
+
+
+# ============================================================================
+# REPORT METADATA EXTRACTOR
+# ============================================================================
 
 class ReportMetadataExtractor:
-    """
-    Extract meaningful report metadata.
-
-    Deliberately excludes visual layout information such as:
-
-        X
-        Y
-        Width
-        Height
-        ZOrder
-        TabOrder
-
-    The useful lineage information is:
-
-        Report
-          -> Page
-          -> Visual
-          -> VisualField
-          -> SemanticTable / SemanticColumn / Measure
-    """
 
     def __init__(
         self,
         definition,
     ):
-
         self.definition = definition
 
         self.parts = get_definition_parts(
@@ -913,23 +1369,15 @@ class ReportMetadataExtractor:
     def extract_pages(
         self,
     ):
-
         pages = []
 
         page_order = []
 
-        # --------------------------------------------------------------------
-        # pages.json
-        # --------------------------------------------------------------------
-
         for part in self.parts:
 
-            path = part.get(
-                "path",
-                "",
-            )
-
-            if path != "definition/pages/pages.json":
+            if part.get("path") != (
+                "definition/pages/pages.json"
+            ):
                 continue
 
             data = parse_json_part(
@@ -948,12 +1396,7 @@ class ReportMetadataExtractor:
                 page_order,
                 list,
             ):
-
                 page_order = []
-
-        # --------------------------------------------------------------------
-        # Individual page files
-        # --------------------------------------------------------------------
 
         page_data = {}
 
@@ -964,11 +1407,12 @@ class ReportMetadataExtractor:
                 "",
             )
 
-            if not re.match(
-                r"^definition/pages/[^/]+/page\.json$",
+            match = re.match(
+                r"^definition/pages/([^/]+)/page\.json$",
                 path,
-            ):
+            )
 
+            if not match:
                 continue
 
             data = parse_json_part(
@@ -978,33 +1422,14 @@ class ReportMetadataExtractor:
             if not data:
                 continue
 
-            page_id = data.get(
-                "name"
+            page_id = (
+                data.get("name")
+                or match.group(1)
             )
-
-            if not page_id:
-
-                match = re.match(
-                    r"^definition/pages/([^/]+)/page\.json$",
-                    path,
-                )
-
-                if match:
-                    page_id = match.group(1)
-
-            if not page_id:
-                continue
 
             page_data[
                 page_id
-            ] = (
-                data,
-                path,
-            )
-
-        # --------------------------------------------------------------------
-        # Preserve Fabric page order
-        # --------------------------------------------------------------------
+            ] = data
 
         ordered_ids = []
 
@@ -1024,27 +1449,21 @@ class ReportMetadataExtractor:
                     page_id
                 )
 
-        # --------------------------------------------------------------------
-        # Build result
-        # --------------------------------------------------------------------
-
         for index, page_id in enumerate(
             ordered_ids,
             start=1,
         ):
 
-            data, path = page_data[
+            data = page_data[
                 page_id
             ]
 
             pages.append(
                 {
                     "page_name": page_id,
-
                     "display_name": data.get(
                         "displayName"
                     ),
-
                     "page_order": index,
                 }
             )
@@ -1058,7 +1477,6 @@ class ReportMetadataExtractor:
     def extract_visuals(
         self,
     ):
-
         visuals = []
 
         for part in self.parts:
@@ -1076,13 +1494,9 @@ class ReportMetadataExtractor:
             if not match:
                 continue
 
-            page_name = match.group(
-                1
-            )
+            page_name = match.group(1)
 
-            visual_id_from_path = match.group(
-                2
-            )
+            visual_id_from_path = match.group(2)
 
             data = parse_json_part(
                 part
@@ -1091,7 +1505,7 @@ class ReportMetadataExtractor:
             if not data:
                 continue
 
-            fabric_visual_id = (
+            visual_id = (
                 data.get("name")
                 or visual_id_from_path
             )
@@ -1105,29 +1519,18 @@ class ReportMetadataExtractor:
                 visual_definition.get(
                     "visualType"
                 )
-            )
-
-            if not visual_type:
-
-                visual_type = (
-                    data.get(
-                        "visualType"
-                    )
-                    or "Unknown"
+                or data.get(
+                    "visualType"
                 )
+                or "Unknown"
+            )
 
             visuals.append(
                 {
                     "page_name": page_name,
-
-                    "fabric_visual_id":
-                        fabric_visual_id,
-
-                    "visual_type":
-                        visual_type,
-
+                    "fabric_visual_id": visual_id,
+                    "visual_type": visual_type,
                     "definition_path": path,
-
                     "raw": data,
                 }
             )
@@ -1142,22 +1545,6 @@ class ReportMetadataExtractor:
         self,
         visual,
     ):
-        """
-        Extract meaningful fields used by a visual.
-
-        Captures:
-
-            Column
-            Measure
-            Aggregation
-
-        and:
-
-            ProjectionArea
-            QueryRef
-            NativeQueryRef
-        """
-
         result = []
 
         raw = visual.get(
@@ -1184,7 +1571,6 @@ class ReportMetadataExtractor:
             query_state,
             dict,
         ):
-
             return result
 
         for projection_area, state in query_state.items():
@@ -1193,7 +1579,6 @@ class ReportMetadataExtractor:
                 state,
                 dict,
             ):
-
                 continue
 
             projections = state.get(
@@ -1205,7 +1590,6 @@ class ReportMetadataExtractor:
                 projections,
                 list,
             ):
-
                 continue
 
             for projection in projections:
@@ -1214,7 +1598,6 @@ class ReportMetadataExtractor:
                     projection,
                     dict,
                 ):
-
                     continue
 
                 field = projection.get(
@@ -1222,16 +1605,10 @@ class ReportMetadataExtractor:
                     {},
                 )
 
-                query_ref = projection.get(
-                    "queryRef"
-                )
-
-                native_query_ref = projection.get(
-                    "nativeQueryRef"
-                )
-
-                field_metadata = self._parse_field(
-                    field
+                field_metadata = (
+                    self._parse_field(
+                        field
+                    )
                 )
 
                 if not field_metadata:
@@ -1243,11 +1620,15 @@ class ReportMetadataExtractor:
 
                 field_metadata[
                     "query_ref"
-                ] = query_ref
+                ] = projection.get(
+                    "queryRef"
+                )
 
                 field_metadata[
                     "native_query_ref"
-                ] = native_query_ref
+                ] = projection.get(
+                    "nativeQueryRef"
+                )
 
                 result.append(
                     field_metadata
@@ -1263,13 +1644,11 @@ class ReportMetadataExtractor:
         self,
         field,
     ):
-        """Normalize a report field."""
 
         if not isinstance(
             field,
             dict,
         ):
-
             return None
 
         # --------------------------------------------------------------------
@@ -1306,13 +1685,9 @@ class ReportMetadataExtractor:
 
             return {
                 "field_type": "Measure",
-
                 "table_name": table_name,
-
                 "column_name": None,
-
                 "measure_name": measure_name,
-
                 "aggregation_function": None,
             }
 
@@ -1350,13 +1725,9 @@ class ReportMetadataExtractor:
 
             return {
                 "field_type": "Column",
-
                 "table_name": table_name,
-
                 "column_name": column_name,
-
                 "measure_name": None,
-
                 "aggregation_function": None,
             }
 
@@ -1408,13 +1779,9 @@ class ReportMetadataExtractor:
 
             return {
                 "field_type": "Column",
-
                 "table_name": table_name,
-
                 "column_name": column_name,
-
                 "measure_name": None,
-
                 "aggregation_function":
                     self._aggregation_name(
                         function_code
@@ -1422,10 +1789,6 @@ class ReportMetadataExtractor:
             }
 
         return None
-
-    # ========================================================================
-    # AGGREGATION
-    # ========================================================================
 
     @staticmethod
     def _aggregation_name(
@@ -1460,7 +1823,6 @@ class ReportMetadataExtractor:
         self,
         visual,
     ):
-
         result = []
 
         raw = visual.get(
@@ -1482,7 +1844,6 @@ class ReportMetadataExtractor:
             filters,
             list,
         ):
-
             return result
 
         for filter_definition in filters:
@@ -1491,24 +1852,15 @@ class ReportMetadataExtractor:
                 filter_definition,
                 dict,
             ):
-
                 continue
 
-            filter_name = filter_definition.get(
-                "name"
-            )
-
-            filter_type = filter_definition.get(
-                "type"
-            )
-
-            field = filter_definition.get(
-                "field",
-                {},
-            )
-
-            field_metadata = self._parse_field(
-                field
+            field_metadata = (
+                self._parse_field(
+                    filter_definition.get(
+                        "field",
+                        {},
+                    )
+                )
             )
 
             if field_metadata:
@@ -1516,30 +1868,29 @@ class ReportMetadataExtractor:
                 result.append(
                     {
                         "filter_name":
-                            filter_name,
-
+                            filter_definition.get(
+                                "name"
+                            ),
                         "field_type":
-                            field_metadata[
+                            field_metadata.get(
                                 "field_type"
-                            ],
-
+                            ),
                         "table_name":
-                            field_metadata[
+                            field_metadata.get(
                                 "table_name"
-                            ],
-
+                            ),
                         "column_name":
-                            field_metadata[
+                            field_metadata.get(
                                 "column_name"
-                            ],
-
+                            ),
                         "measure_name":
-                            field_metadata[
+                            field_metadata.get(
                                 "measure_name"
-                            ],
-
+                            ),
                         "filter_type":
-                            filter_type,
+                            filter_definition.get(
+                                "type"
+                            ),
                     }
                 )
 
@@ -1548,22 +1899,17 @@ class ReportMetadataExtractor:
                 result.append(
                     {
                         "filter_name":
-                            filter_name,
-
-                        "field_type":
-                            None,
-
-                        "table_name":
-                            None,
-
-                        "column_name":
-                            None,
-
-                        "measure_name":
-                            None,
-
+                            filter_definition.get(
+                                "name"
+                            ),
+                        "field_type": None,
+                        "table_name": None,
+                        "column_name": None,
+                        "measure_name": None,
                         "filter_type":
-                            filter_type,
+                            filter_definition.get(
+                                "type"
+                            ),
                     }
                 )
 
@@ -1571,14 +1917,12 @@ class ReportMetadataExtractor:
 
 
 # ============================================================================
-# SEMANTIC MODEL LOOKUPS
+# LOOKUPS
 # ============================================================================
-
 
 def build_semantic_table_lookup(
     cursor,
 ):
-
     cursor.execute(
         """
         SELECT
@@ -1591,20 +1935,14 @@ def build_semantic_table_lookup(
 
     lookup = {}
 
-    for (
-        semantic_table_id,
-        semantic_model_id,
-        table_name,
-    ) in cursor.fetchall():
+    for row in cursor.fetchall():
 
         lookup[
             (
-                int(semantic_model_id),
-                str(table_name),
+                int(row[1]),
+                str(row[2]),
             )
-        ] = int(
-            semantic_table_id
-        )
+        ] = int(row[0])
 
     return lookup
 
@@ -1612,7 +1950,6 @@ def build_semantic_table_lookup(
 def build_semantic_column_lookup(
     cursor,
 ):
-
     cursor.execute(
         """
         SELECT
@@ -1629,23 +1966,15 @@ def build_semantic_column_lookup(
 
     lookup = {}
 
-    for (
-        semantic_column_id,
-        semantic_table_id,
-        semantic_model_id,
-        table_name,
-        column_name,
-    ) in cursor.fetchall():
+    for row in cursor.fetchall():
 
         lookup[
             (
-                int(semantic_model_id),
-                str(table_name),
-                str(column_name),
+                int(row[2]),
+                str(row[3]),
+                str(row[4]),
             )
-        ] = int(
-            semantic_column_id
-        )
+        ] = int(row[0])
 
     return lookup
 
@@ -1653,7 +1982,6 @@ def build_semantic_column_lookup(
 def build_measure_lookup(
     cursor,
 ):
-
     cursor.execute(
         """
         SELECT
@@ -1666,64 +1994,21 @@ def build_measure_lookup(
 
     lookup = {}
 
-    for (
-        measure_id,
-        semantic_model_id,
-        measure_name,
-    ) in cursor.fetchall():
+    for row in cursor.fetchall():
 
         lookup[
             (
-                int(semantic_model_id),
-                str(measure_name),
+                int(row[1]),
+                str(row[2]),
             )
-        ] = int(
-            measure_id
-        )
+        ] = int(row[0])
 
     return lookup
 
 
 # ============================================================================
-# SEMANTIC MODEL REPOSITORY ID
-# ============================================================================
-
-
-def get_repository_semantic_model_id(
-    cursor,
-    fabric_model_id,
-):
-    """Resolve FabricModelID -> repository SemanticModelID."""
-
-    cursor.execute(
-        """
-        SELECT
-            SemanticModelID
-        FROM dbo.MetadataSemanticModel
-        WHERE FabricModelID = ?
-        """,
-        fabric_model_id,
-    )
-
-    result = cursor.fetchone()
-
-    if not result:
-
-        raise RuntimeError(
-            "Fabric semantic model exists in Fabric but was not "
-            "found in MetadataSemanticModel. "
-            f"FabricModelID: {fabric_model_id}"
-        )
-
-    return int(
-        result[0]
-    )
-
-
-# ============================================================================
 # REPORT REPOSITORY
 # ============================================================================
-
 
 def get_or_create_report(
     cursor,
@@ -1731,17 +2016,9 @@ def get_or_create_report(
     report_id,
     semantic_model_id,
 ):
-    """
-    Insert or update MetadataReport.
-
-    This function is now reached even when the report does not
-    already exist.
-    """
-
     cursor.execute(
         """
-        SELECT
-            ReportID
+        SELECT ReportID
         FROM dbo.MetadataReport
         WHERE FabricReportID = ?
         """,
@@ -1777,8 +2054,8 @@ def get_or_create_report(
 
         cursor.connection.commit()
 
-        logging.info(
-            "Updated existing MetadataReport: %s",
+        logger.info(
+            "Updated MetadataReport %s",
             repository_report_id,
         )
 
@@ -1809,8 +2086,7 @@ def get_or_create_report(
 
     cursor.execute(
         """
-        SELECT
-            ReportID
+        SELECT ReportID
         FROM dbo.MetadataReport
         WHERE FabricReportID = ?
         """,
@@ -1820,42 +2096,21 @@ def get_or_create_report(
     result = cursor.fetchone()
 
     if not result:
-
         raise RuntimeError(
             "Could not retrieve ReportID after insert."
         )
 
-    repository_report_id = int(
-        result[0]
-    )
-
-    logging.info(
-        "Created MetadataReport: %s",
-        repository_report_id,
-    )
-
-    return repository_report_id
+    return int(result[0])
 
 
 # ============================================================================
-# CLEAR REPORT CHILD METADATA
+# CLEAR REPORT CHILDREN
 # ============================================================================
-
 
 def clear_report_children(
     cursor,
     report_id,
 ):
-    """
-    Refresh report child metadata.
-
-    Delete order:
-
-        VisualFilter
-        VisualField
-        Visual
-        Page
-    """
 
     cursor.execute(
         """
@@ -1916,16 +2171,10 @@ def clear_report_children(
 
     cursor.connection.commit()
 
-    logging.info(
-        "Cleared existing child metadata for ReportID %s.",
-        report_id,
-    )
-
 
 # ============================================================================
 # LOAD PAGES
 # ============================================================================
-
 
 def load_pages(
     cursor,
@@ -1933,7 +2182,7 @@ def load_pages(
     pages,
 ):
 
-    page_lookup = {}
+    lookup = {}
 
     for page in pages:
 
@@ -1956,8 +2205,7 @@ def load_pages(
 
         cursor.execute(
             """
-            SELECT
-                PageID
+            SELECT PageID
             FROM dbo.MetadataReportPage
             WHERE ReportID = ?
               AND PageName = ?
@@ -1971,30 +2219,22 @@ def load_pages(
         if not result:
 
             raise RuntimeError(
-                "Could not retrieve PageID for page: "
+                f"Could not retrieve PageID for "
                 f"{page['page_name']}"
             )
 
-        page_lookup[
+        lookup[
             page["page_name"]
-        ] = int(
-            result[0]
-        )
+        ] = int(result[0])
 
     cursor.connection.commit()
 
-    logging.info(
-        "Pages loaded: %d",
-        len(pages),
-    )
-
-    return page_lookup
+    return lookup
 
 
 # ============================================================================
 # LOAD VISUALS
 # ============================================================================
-
 
 def load_visuals(
     cursor,
@@ -2002,7 +2242,7 @@ def load_visuals(
     visuals,
 ):
 
-    visual_lookup = {}
+    lookup = {}
 
     for visual in visuals:
 
@@ -2012,10 +2252,9 @@ def load_visuals(
 
         if page_id is None:
 
-            logging.warning(
-                "Page not found for visual %s: %s",
+            logger.warning(
+                "Page not found for visual %s",
                 visual["fabric_visual_id"],
-                visual["page_name"],
             )
 
             continue
@@ -2037,8 +2276,7 @@ def load_visuals(
 
         cursor.execute(
             """
-            SELECT
-                VisualID
+            SELECT VisualID
             FROM dbo.MetadataReportVisual
             WHERE PageID = ?
               AND FabricVisualID = ?
@@ -2050,32 +2288,22 @@ def load_visuals(
         result = cursor.fetchone()
 
         if not result:
-
             raise RuntimeError(
-                "Could not retrieve VisualID for visual: "
-                f"{visual['fabric_visual_id']}"
+                "Could not retrieve VisualID."
             )
 
-        visual_lookup[
+        lookup[
             visual["fabric_visual_id"]
-        ] = int(
-            result[0]
-        )
+        ] = int(result[0])
 
     cursor.connection.commit()
 
-    logging.info(
-        "Visuals loaded: %d",
-        len(visual_lookup),
-    )
-
-    return visual_lookup
+    return lookup
 
 
 # ============================================================================
-# RESOLVE FIELD IDS
+# FIELD ID RESOLUTION
 # ============================================================================
-
 
 def resolve_field_ids(
     field,
@@ -2084,7 +2312,6 @@ def resolve_field_ids(
     semantic_column_lookup,
     measure_lookup,
 ):
-    """Resolve repository IDs for a report field."""
 
     table_name = field.get(
         "table_name"
@@ -2102,10 +2329,6 @@ def resolve_field_ids(
     semantic_column_id = None
     measure_id = None
 
-    # ------------------------------------------------------------------------
-    # Semantic table
-    # ------------------------------------------------------------------------
-
     if table_name:
 
         semantic_table_id = (
@@ -2117,14 +2340,7 @@ def resolve_field_ids(
             )
         )
 
-    # ------------------------------------------------------------------------
-    # Semantic column
-    # ------------------------------------------------------------------------
-
-    if (
-        table_name
-        and column_name
-    ):
+    if table_name and column_name:
 
         semantic_column_id = (
             semantic_column_lookup.get(
@@ -2135,10 +2351,6 @@ def resolve_field_ids(
                 )
             )
         )
-
-    # ------------------------------------------------------------------------
-    # Measure
-    # ------------------------------------------------------------------------
 
     if measure_name:
 
@@ -2162,7 +2374,6 @@ def resolve_field_ids(
 # LOAD VISUAL FIELDS
 # ============================================================================
 
-
 def load_visual_fields(
     cursor,
     visual_lookup,
@@ -2174,7 +2385,6 @@ def load_visual_fields(
 ):
 
     inserted = 0
-
     unresolved = 0
 
     for visual in visuals:
@@ -2186,12 +2396,10 @@ def load_visual_fields(
         if visual_id is None:
             continue
 
-        fields = visual.get(
+        for field in visual.get(
             "fields",
             [],
-        )
-
-        for field in fields:
+        ):
 
             (
                 semantic_table_id,
@@ -2212,11 +2420,9 @@ def load_visual_fields(
 
                 unresolved += 1
 
-                logging.warning(
-                    "Could not resolve semantic table "
-                    "'%s' for visual '%s'.",
+                logger.warning(
+                    "Unresolved semantic table: %s",
                     field.get("table_name"),
-                    visual["fabric_visual_id"],
                 )
 
             if (
@@ -2226,12 +2432,10 @@ def load_visual_fields(
 
                 unresolved += 1
 
-                logging.warning(
-                    "Could not resolve semantic column "
-                    "'%s.%s' for visual '%s'.",
+                logger.warning(
+                    "Unresolved semantic column: %s.%s",
                     field.get("table_name"),
                     field.get("column_name"),
-                    visual["fabric_visual_id"],
                 )
 
             if (
@@ -2241,11 +2445,9 @@ def load_visual_fields(
 
                 unresolved += 1
 
-                logging.warning(
-                    "Could not resolve measure "
-                    "'%s' for visual '%s'.",
+                logger.warning(
+                    "Unresolved measure: %s",
                     field.get("measure_name"),
-                    visual["fabric_visual_id"],
                 )
 
             cursor.execute(
@@ -2265,9 +2467,7 @@ def load_visual_fields(
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 visual_id,
-                field.get(
-                    "field_type"
-                ),
+                field.get("field_type"),
                 semantic_table_id,
                 semantic_column_id,
                 measure_id,
@@ -2289,14 +2489,9 @@ def load_visual_fields(
 
     cursor.connection.commit()
 
-    logging.info(
-        "Visual fields loaded: %d",
-        inserted,
-    )
-
     if unresolved:
 
-        logging.warning(
+        logger.warning(
             "Unresolved visual field references: %d",
             unresolved,
         )
@@ -2305,9 +2500,8 @@ def load_visual_fields(
 
 
 # ============================================================================
-# LOAD VISUAL FILTERS
+# LOAD FILTERS
 # ============================================================================
-
 
 def load_visual_filters(
     cursor,
@@ -2320,7 +2514,6 @@ def load_visual_filters(
 ):
 
     inserted = 0
-
     unresolved = 0
 
     for visual in visuals:
@@ -2332,12 +2525,10 @@ def load_visual_filters(
         if visual_id is None:
             continue
 
-        filters = visual.get(
+        for filter_definition in visual.get(
             "filters",
             [],
-        )
-
-        for filter_definition in filters:
+        ):
 
             (
                 semantic_table_id,
@@ -2355,21 +2546,18 @@ def load_visual_filters(
                 filter_definition.get("table_name")
                 and semantic_table_id is None
             ):
-
                 unresolved += 1
 
             if (
                 filter_definition.get("column_name")
                 and semantic_column_id is None
             ):
-
                 unresolved += 1
 
             if (
                 filter_definition.get("measure_name")
                 and measure_id is None
             ):
-
                 unresolved += 1
 
             cursor.execute(
@@ -2405,14 +2593,9 @@ def load_visual_filters(
 
     cursor.connection.commit()
 
-    logging.info(
-        "Visual filters loaded: %d",
-        inserted,
-    )
-
     if unresolved:
 
-        logging.warning(
+        logger.warning(
             "Unresolved visual filter references: %d",
             unresolved,
         )
@@ -2424,14 +2607,12 @@ def load_visual_filters(
 # ENRICH VISUALS
 # ============================================================================
 
-
 def enrich_visuals(
     extractor,
     visuals,
 ):
 
     total_fields = 0
-
     total_filters = 0
 
     for visual in visuals:
@@ -2445,16 +2626,10 @@ def enrich_visuals(
         )
 
         visual["fields"] = fields
-
         visual["filters"] = filters
 
-        total_fields += len(
-            fields
-        )
-
-        total_filters += len(
-            filters
-        )
+        total_fields += len(fields)
+        total_filters += len(filters)
 
     return (
         total_fields,
@@ -2463,24 +2638,18 @@ def enrich_visuals(
 
 
 # ============================================================================
-# PROCESS REPORT
+# PROCESS ONE REPORT
 # ============================================================================
-
 
 def process_report(
     client,
     cursor,
     report,
+    workspace_items,
 ):
-    """Extract and load one Fabric report."""
 
-    report_name = report[
-        "name"
-    ]
-
-    report_id = report[
-        "id"
-    ]
+    report_name = report["name"]
+    report_id = report["id"]
 
     print()
     print("=" * 70)
@@ -2494,7 +2663,7 @@ def process_report(
     )
 
     # ========================================================================
-    # 1. GET REPORT DEFINITION
+    # 1. GET DEFINITION
     # ========================================================================
 
     print()
@@ -2534,6 +2703,7 @@ def process_report(
             report,
             definition,
             cursor,
+            workspace_items,
         )
     )
 
@@ -2543,7 +2713,7 @@ def process_report(
     )
 
     # ========================================================================
-    # 3. RESOLVE REPOSITORY SEMANTIC MODEL
+    # 3. REPOSITORY MODEL
     # ========================================================================
 
     repository_semantic_model_id = (
@@ -2559,7 +2729,7 @@ def process_report(
     )
 
     # ========================================================================
-    # 4. CREATE / UPDATE REPORT
+    # 4. REPORT
     # ========================================================================
 
     repository_report_id = (
@@ -2577,7 +2747,7 @@ def process_report(
     )
 
     # ========================================================================
-    # 5. PARSE REPORT
+    # 5. PARSE
     # ========================================================================
 
     extractor = ReportMetadataExtractor(
@@ -2596,13 +2766,8 @@ def process_report(
         visuals,
     )
 
-    print()
-    print(
-        "Refreshing report child metadata..."
-    )
-
     # ========================================================================
-    # 6. CLEAR PREVIOUS CHILDREN
+    # 6. REFRESH
     # ========================================================================
 
     clear_report_children(
@@ -2611,7 +2776,7 @@ def process_report(
     )
 
     # ========================================================================
-    # 7. LOAD PAGES
+    # 7. PAGES
     # ========================================================================
 
     page_lookup = load_pages(
@@ -2621,7 +2786,7 @@ def process_report(
     )
 
     # ========================================================================
-    # 8. LOAD VISUALS
+    # 8. VISUALS
     # ========================================================================
 
     visual_lookup = load_visuals(
@@ -2631,7 +2796,7 @@ def process_report(
     )
 
     # ========================================================================
-    # 9. BUILD SEMANTIC LOOKUPS
+    # 9. LOOKUPS
     # ========================================================================
 
     semantic_table_lookup = (
@@ -2653,7 +2818,7 @@ def process_report(
     )
 
     # ========================================================================
-    # 10. LOAD VISUAL FIELDS
+    # 10. FIELDS
     # ========================================================================
 
     loaded_fields = load_visual_fields(
@@ -2667,7 +2832,7 @@ def process_report(
     )
 
     # ========================================================================
-    # 11. LOAD VISUAL FILTERS
+    # 11. FILTERS
     # ========================================================================
 
     loaded_filters = load_visual_filters(
@@ -2707,7 +2872,7 @@ def process_report(
 
     if extracted_fields != loaded_fields:
 
-        logging.warning(
+        logger.warning(
             "Extracted fields (%d) != loaded fields (%d).",
             extracted_fields,
             loaded_fields,
@@ -2715,7 +2880,7 @@ def process_report(
 
     if extracted_filters != loaded_filters:
 
-        logging.warning(
+        logger.warning(
             "Extracted filters (%d) != loaded filters (%d).",
             extracted_filters,
             loaded_filters,
@@ -2724,6 +2889,7 @@ def process_report(
     return {
         "report_name": report_name,
         "report_id": report_id,
+        "semantic_model_id": fabric_semantic_model_id,
         "pages": len(pages),
         "visuals": len(visuals),
         "fields": loaded_fields,
@@ -2734,7 +2900,6 @@ def process_report(
 # ============================================================================
 # MAIN
 # ============================================================================
-
 
 def main():
 
@@ -2752,15 +2917,11 @@ def main():
     repository_connection = None
 
     successful = []
-
     failed = []
 
     total_pages = 0
-
     total_visuals = 0
-
     total_fields = 0
-
     total_filters = 0
 
     try:
@@ -2795,12 +2956,8 @@ def main():
         ):
 
             actual_workspace_name = (
-                workspace.get(
-                    "displayName"
-                )
-                or workspace.get(
-                    "name"
-                )
+                workspace.get("displayName")
+                or workspace.get("name")
                 or WORKSPACE_NAME
             )
 
@@ -2815,7 +2972,25 @@ def main():
         )
 
         # ====================================================================
-        # 3. REPORT DISCOVERY
+        # 3. DISCOVER WORKSPACE ITEMS
+        # ====================================================================
+
+        print()
+        print(
+            "Discovering workspace items..."
+        )
+
+        workspace_items = get_workspace_items(
+            client,
+            WORKSPACE_ID,
+        )
+
+        print_workspace_inventory(
+            workspace_items
+        )
+
+        # ====================================================================
+        # 4. REPORT DISCOVERY
         # ====================================================================
 
         print()
@@ -2823,9 +2998,8 @@ def main():
             "Discovering reports automatically..."
         )
 
-        reports = discover_reports(
-            client,
-            WORKSPACE_ID,
+        reports = discover_reports_from_items(
+            workspace_items
         )
 
         print(
@@ -2858,7 +3032,7 @@ def main():
             )
 
         # ====================================================================
-        # 4. CONNECT TO METADATA REPOSITORY
+        # 5. CONNECT REPOSITORY
         # ====================================================================
 
         print()
@@ -2889,7 +3063,7 @@ def main():
         )
 
         # ====================================================================
-        # 5. PROCESS REPORTS
+        # 6. PROCESS REPORTS
         # ====================================================================
 
         for report in reports:
@@ -2900,6 +3074,7 @@ def main():
                     client,
                     cursor,
                     report,
+                    workspace_items,
                 )
 
                 successful.append(
@@ -2931,7 +3106,7 @@ def main():
                     }
                 )
 
-                logging.exception(
+                logger.exception(
                     "Failed processing report '%s'.",
                     report["name"],
                 )
@@ -2942,10 +3117,8 @@ def main():
                     f"'{report['name']}': {exc}"
                 )
 
-                continue
-
         # ====================================================================
-        # 6. FINAL SUMMARY
+        # 7. FINAL SUMMARY
         # ====================================================================
 
         print()
@@ -2989,6 +3162,7 @@ def main():
             print(
                 "FAILED REPORTS"
             )
+
             print(
                 "-" * 70
             )
@@ -3016,7 +3190,7 @@ def main():
 
     except Exception as exc:
 
-        logging.exception(
+        logger.exception(
             "Report metadata extraction failed."
         )
 
@@ -3034,7 +3208,7 @@ def main():
 
             repository_connection.close()
 
-            logging.info(
+            logger.info(
                 "Closed MetadataRepository connection."
             )
 
@@ -3048,4 +3222,3 @@ if __name__ == "__main__":
     raise SystemExit(
         main()
     )
-
