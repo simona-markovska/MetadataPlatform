@@ -1,3 +1,4 @@
+
 """
 Metadata Intelligence Platform
 Read-only MCP server for Microsoft Fabric MetadataRepository.
