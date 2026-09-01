@@ -1,0 +1,14 @@
+{
+  "workspaces": [
+    {
+      "workspace_id": "7a6e5bfa-8068-4e86-89f5-d6f629ab7ced",
+      "workspace_name": "Metadata Intelligence Platform",
+      "enabled": true
+    },
+    {
+      "workspace_id": "ca34c4e0-b59c-4c4a-9ad1-398fcb660472",
+      "workspace_name": "AXM Demo Reports",
+      "enabled": true
+    }
+  ]
+}

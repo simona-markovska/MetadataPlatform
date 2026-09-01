@@ -27,6 +27,9 @@ $TunnelName = "majestic-horse-mtz22x4.eun1"
 $McpHost = "127.0.0.1"
 $McpPort = 8000
 
+$McpProcess = $null
+$TunnelProcess = $null
+
 
 # ----------------------------------------------------------------------------
 # Header
@@ -86,7 +89,7 @@ if ($ExistingConnection) {
         -ErrorAction SilentlyContinue
 
     if ($ExistingProcess) {
-        Write-Host "Process: $($ExistingProcess.ProcessName)"
+        Write-Host "Process: $($ExistingProcess.ProcessName)" -ForegroundColor Yellow
     }
 
     Write-Host ""
@@ -103,26 +106,41 @@ if ($ExistingConnection) {
     Write-Host ""
     Write-Host "[2/4] Starting MCP server..." -ForegroundColor Yellow
 
-    Start-Process `
+    $McpProcess = Start-Process `
         -FilePath $PythonExe `
-        -ArgumentList "`"$McpServer`"" `
-        -WorkingDirectory $ProjectRoot
+        -ArgumentList @(
+            "`"$McpServer`""
+        ) `
+        -WorkingDirectory $ProjectRoot `
+        -PassThru
 
     Write-Host "MCP server process started." -ForegroundColor Green
+    Write-Host "MCP process ID: $($McpProcess.Id)" -ForegroundColor DarkGray
 
     # ------------------------------------------------------------------------
-    # Wait for port 8000
+    # Wait for MCP server
     # ------------------------------------------------------------------------
 
     Write-Host "Waiting for MCP server to listen on port $McpPort..." -ForegroundColor Yellow
 
     $MaxAttempts = 30
     $Attempt = 0
+    $Connection = $null
 
     do {
 
         Start-Sleep -Seconds 1
         $Attempt++
+
+        # Check whether Python has already died
+        if ($McpProcess.HasExited) {
+
+            Write-Host ""
+            Write-Host "ERROR: MCP server process exited unexpectedly." -ForegroundColor Red
+            Write-Host "Exit code: $($McpProcess.ExitCode)" -ForegroundColor Red
+
+            exit 1
+        }
 
         $Connection = Get-NetTCPConnection `
             -LocalPort $McpPort `
@@ -140,12 +158,40 @@ if ($ExistingConnection) {
     Write-Host ""
 
     if (-not $Connection) {
+
         Write-Host "ERROR: MCP server did not start on port $McpPort." -ForegroundColor Red
+
+        if (-not $McpProcess.HasExited) {
+            Stop-Process -Id $McpProcess.Id -Force
+        }
+
         exit 1
     }
 
     Write-Host "MCP server is listening on $McpHost`:$McpPort" -ForegroundColor Green
+    Write-Host "MCP process is still running." -ForegroundColor Green
 }
+
+
+# ----------------------------------------------------------------------------
+# Verify MCP server before starting tunnel
+# ----------------------------------------------------------------------------
+
+Write-Host ""
+Write-Host "Verifying MCP server process..." -ForegroundColor Yellow
+
+$Connection = Get-NetTCPConnection `
+    -LocalPort $McpPort `
+    -State Listen `
+    -ErrorAction SilentlyContinue
+
+if (-not $Connection) {
+
+    Write-Host "ERROR: Port $McpPort is no longer listening." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "MCP server verified on port $McpPort." -ForegroundColor Green
 
 
 # ----------------------------------------------------------------------------
@@ -159,12 +205,34 @@ Write-Host ""
 Write-Host "Tunnel: $TunnelName" -ForegroundColor Cyan
 Write-Host ""
 
-& $TunnelExe host $TunnelName
+try {
 
+    # IMPORTANT:
+    # Keep the tunnel attached to this PowerShell window.
+    # The tunnel remains active while this script is running.
 
-# ----------------------------------------------------------------------------
-# End
-# ----------------------------------------------------------------------------
+    & $TunnelExe host $TunnelName
 
-Write-Host ""
-Write-Host "[4/4] MCP environment stopped." -ForegroundColor Yellow
+}
+finally {
+
+    # ------------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------------
+
+    Write-Host ""
+    Write-Host "Stopping MCP environment..." -ForegroundColor Yellow
+
+    if ($McpProcess -and -not $McpProcess.HasExited) {
+
+        Write-Host "Stopping MCP server process $($McpProcess.Id)..." -ForegroundColor Yellow
+
+        Stop-Process `
+            -Id $McpProcess.Id `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+
+    Write-Host ""
+    Write-Host "[4/4] MCP environment stopped." -ForegroundColor Yellow
+}
