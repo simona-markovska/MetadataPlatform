@@ -1,32 +1,39 @@
 ﻿import argparse
 import logging
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
-# Ensure the workspace root is on sys.path when this script is executed directly.
-ROOT_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT_DIR))
-
 import pandas as pd
 import pyodbc
+
+# ---------------------------------------------------------------------------
+# PROJECT ROOT
+# ---------------------------------------------------------------------------
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 
 from config.config import (
     DEFAULT_DRIVER,
     DEFAULT_OUTPUT_DIR,
-    DEFAULT_REPOSITORY_DATABASE,
     DEFAULT_SERVER,
     DEFAULT_SOURCE_DATABASE,
 )
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# CONFIGURATION
+# ===========================================================================
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
+# ---------------------------------------------------------------------------
+# METADATA REPOSITORY
+# ---------------------------------------------------------------------------
 
 # Fabric Warehouse SQL endpoint
 FABRIC_SQL_SERVER = (
@@ -38,26 +45,80 @@ FABRIC_SQL_DATABASE = "MetadataRepository"
 
 
 # ---------------------------------------------------------------------------
-# Utility functions
+# Source system identifier
 # ---------------------------------------------------------------------------
+
+SOURCE_SYSTEM = "SQLSERVER"
+
+
+# ---------------------------------------------------------------------------
+# Batch size
+#
+# Fabric Warehouse is accessed over a network connection. We therefore
+# avoid issuing one transaction per row.
+# ---------------------------------------------------------------------------
+
+BATCH_SIZE = 250
+
+
+# ===========================================================================
+# LOGGING
+# ===========================================================================
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format=LOG_FORMAT,
+    )
+
+
+# ===========================================================================
+# GENERAL UTILITIES
+# ===========================================================================
+
 
 def ensure_output_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+    path.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
 
-# ---------------------------------------------------------------------------
-# SOURCE DATABASE CONNECTION
-# ---------------------------------------------------------------------------
-#
-# Source:
-#   Server   : AXM345
-#   Database : AdventureWorks2022
-#
-# Authentication:
-#   Windows Authentication
-#
-# This is the original source authentication.
-# ---------------------------------------------------------------------------
+def clean_value(value) -> str:
+    """
+    Convert a value to a clean string.
+
+    This is used for stable source keys.
+    """
+
+    if value is None:
+        return ""
+
+    if pd.isna(value):
+        return ""
+
+    return str(value).strip()
+
+
+def nullable_int(value):
+    """
+    Convert pandas numeric/null values to Python int/None.
+    """
+
+    if value is None:
+        return None
+
+    if pd.isna(value):
+        return None
+
+    return int(value)
+
+
+# ===========================================================================
+# SOURCE CONNECTION
+# ===========================================================================
+
 
 def get_source_connection_string(
     driver: str,
@@ -86,22 +147,27 @@ def connect_to_source(
         database,
     )
 
-    return pyodbc.connect(connection_string)
+    logging.info(
+        "Connecting to source SQL Server %s / %s",
+        server,
+        database,
+    )
+
+    connection = pyodbc.connect(
+        connection_string,
+    )
+
+    logging.info(
+        "Source connection successful."
+    )
+
+    return connection
 
 
-# ---------------------------------------------------------------------------
-# FABRIC WAREHOUSE DESTINATION CONNECTION
-# ---------------------------------------------------------------------------
-#
-# Destination:
-#   Fabric Warehouse
-#
-# Authentication:
-#   Microsoft Entra Interactive Authentication
-#
-# This is the same authentication method that was successfully tested
-# in the standalone Fabric Metadata Repository test.
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# FABRIC WAREHOUSE CONNECTION
+# ===========================================================================
+
 
 def get_fabric_connection_string(
     driver: str,
@@ -131,12 +197,72 @@ def connect_to_fabric_warehouse(
         database,
     )
 
-    return pyodbc.connect(connection_string)
+    logging.info(
+        "Connecting to Fabric Warehouse %s / %s",
+        server,
+        database,
+    )
+
+    connection = pyodbc.connect(
+        connection_string,
+    )
+
+    logging.info(
+        "Repository connection successful."
+    )
+
+    return connection
 
 
-# ---------------------------------------------------------------------------
-# Metadata database
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# STABLE SOURCE KEYS
+# ===========================================================================
+
+
+def build_source_object_key(
+    source_system: str,
+    server_name: str,
+    database_name: str,
+    schema_name: str,
+    table_name: str,
+) -> str:
+
+    return "|".join(
+        [
+            clean_value(source_system),
+            clean_value(server_name),
+            clean_value(database_name),
+            clean_value(schema_name),
+            clean_value(table_name),
+        ]
+    )
+
+
+def build_source_column_key(
+    source_system: str,
+    server_name: str,
+    database_name: str,
+    schema_name: str,
+    table_name: str,
+    column_name: str,
+) -> str:
+
+    return "|".join(
+        [
+            clean_value(source_system),
+            clean_value(server_name),
+            clean_value(database_name),
+            clean_value(schema_name),
+            clean_value(table_name),
+            clean_value(column_name),
+        ]
+    )
+
+
+# ===========================================================================
+# DATABASE METADATA
+# ===========================================================================
+
 
 def get_database_id(
     cursor: pyodbc.Cursor,
@@ -147,7 +273,7 @@ def get_database_id(
     cursor.execute(
         """
         SELECT DatabaseID
-        FROM MetadataDatabase
+        FROM dbo.MetadataDatabase
         WHERE DatabaseName = ?
           AND ServerName = ?
         """,
@@ -157,26 +283,33 @@ def get_database_id(
 
     result = cursor.fetchone()
 
-    return result[0] if result else None
+    if result is None:
+        return None
+
+    return int(result[0])
 
 
-def insert_database(
+def create_database(
     cursor: pyodbc.Cursor,
     database_name: str,
     server_name: str,
 ) -> int:
 
+    source_system = SOURCE_SYSTEM
+
     cursor.execute(
         """
-        INSERT INTO MetadataDatabase
+        INSERT INTO dbo.MetadataDatabase
         (
             DatabaseName,
-            ServerName
+            ServerName,
+            SourceSystem
         )
-        VALUES (?, ?)
+        VALUES (?, ?, ?)
         """,
         database_name,
         server_name,
+        source_system,
     )
 
     cursor.connection.commit()
@@ -189,133 +322,54 @@ def insert_database(
 
     if database_id is None:
         raise RuntimeError(
-            "Failed to retrieve DatabaseID after inserting database."
+            "Database was inserted but DatabaseID could not be resolved."
         )
+
+    logging.info(
+        "Created DatabaseID=%s",
+        database_id,
+    )
 
     return database_id
 
 
-# ---------------------------------------------------------------------------
-# Extraction logging
-# ---------------------------------------------------------------------------
-
-def start_extraction_log(
+def get_or_create_database(
     cursor: pyodbc.Cursor,
-    database_id: int,
+    database_name: str,
+    server_name: str,
 ) -> int:
 
-    start_time = datetime.now()
-
-    # Fabric Warehouse does not support:
-    #
-    # OUTPUT INSERTED.ExtractionID
-    #
-    # Therefore, insert the record first and then retrieve
-    # the generated identity value.
-
-    cursor.execute(
-        """
-        INSERT INTO MetadataExtractionLog
-        (
-            DatabaseID,
-            StartTime,
-            Status
-        )
-        VALUES (?, ?, ?)
-        """,
-        database_id,
-        start_time,
-        "Running",
+    database_id = get_database_id(
+        cursor,
+        database_name,
+        server_name,
     )
 
-    cursor.connection.commit()
-
-    cursor.execute(
-        """
-        SELECT MAX(ExtractionID)
-        FROM MetadataExtractionLog
-        WHERE DatabaseID = ?
-          AND StartTime = ?
-          AND Status = ?
-        """,
-        database_id,
-        start_time,
-        "Running",
-    )
-
-    identity_result = cursor.fetchone()
-
-    if not identity_result or identity_result[0] is None:
-        cursor.connection.rollback()
-
-        raise RuntimeError(
-            "Failed to retrieve ExtractionID after starting extraction log."
+    if database_id is not None:
+        logging.info(
+            "Existing DatabaseID=%s found.",
+            database_id,
         )
 
-    extraction_id = int(identity_result[0])
+        return database_id
 
-    return extraction_id
-
-
-def update_extraction_log(
-    cursor: pyodbc.Cursor,
-    extraction_id: int,
-    status: str,
-    tables_loaded: int | None = None,
-    columns_loaded: int | None = None,
-    relationships_loaded: int | None = None,
-    error_message: str | None = None,
-) -> None:
-
-    columns = [
-        "EndTime = ?",
-        "Status = ?",
-    ]
-
-    params = [
-        datetime.now(),
-        status,
-    ]
-
-    if tables_loaded is not None:
-        columns.append("TablesLoaded = ?")
-        params.append(tables_loaded)
-
-    if columns_loaded is not None:
-        columns.append("ColumnsLoaded = ?")
-        params.append(columns_loaded)
-
-    if relationships_loaded is not None:
-        columns.append("RelationshipsLoaded = ?")
-        params.append(relationships_loaded)
-
-    if error_message is not None:
-        columns.append("ErrorMessage = ?")
-        params.append(error_message)
-
-    params.append(extraction_id)
-
-    cursor.execute(
-        f"""
-        UPDATE MetadataExtractionLog
-        SET {", ".join(columns)}
-        WHERE ExtractionID = ?
-        """,
-        *params,
+    return create_database(
+        cursor,
+        database_name,
+        server_name,
     )
 
-    cursor.connection.commit()
 
+# ===========================================================================
+# SOURCE EXTRACTION
+# ===========================================================================
 
-# ---------------------------------------------------------------------------
-# Extract tables
-# ---------------------------------------------------------------------------
 
 def extract_tables(
     source_conn: pyodbc.Connection,
 ) -> pd.DataFrame:
 
-    tables_query = """
+    query = """
     SELECT
         TABLE_SCHEMA,
         TABLE_NAME,
@@ -326,28 +380,36 @@ def extract_tables(
         TABLE_NAME;
     """
 
-    tables = pd.read_sql(
-        tables_query,
-        source_conn,
+    cursor = source_conn.cursor()
+
+    cursor.execute(query)
+
+    rows = cursor.fetchall()
+
+    columns = [
+        "TABLE_SCHEMA",
+        "TABLE_NAME",
+        "TABLE_TYPE",
+    ]
+
+    tables = pd.DataFrame.from_records(
+        rows,
+        columns=columns,
     )
 
     logging.info(
-        "Extracted %d tables from source database",
+        "Extracted %d source objects",
         len(tables),
     )
 
     return tables
 
 
-# ---------------------------------------------------------------------------
-# Extract columns
-# ---------------------------------------------------------------------------
-
 def extract_columns(
     source_conn: pyodbc.Connection,
 ) -> pd.DataFrame:
 
-    columns_query = """
+    query = """
     SELECT
         TABLE_SCHEMA,
         TABLE_NAME,
@@ -363,28 +425,40 @@ def extract_columns(
         ORDINAL_POSITION;
     """
 
-    columns = pd.read_sql(
-        columns_query,
-        source_conn,
+    cursor = source_conn.cursor()
+
+    cursor.execute(query)
+
+    rows = cursor.fetchall()
+
+    columns = [
+        "TABLE_SCHEMA",
+        "TABLE_NAME",
+        "ORDINAL_POSITION",
+        "COLUMN_NAME",
+        "DATA_TYPE",
+        "CHARACTER_MAXIMUM_LENGTH",
+        "IS_NULLABLE",
+    ]
+
+    dataframe = pd.DataFrame.from_records(
+        rows,
+        columns=columns,
     )
 
     logging.info(
-        "Extracted %d columns from source database",
-        len(columns),
+        "Extracted %d source columns",
+        len(dataframe),
     )
 
-    return columns
+    return dataframe
 
-
-# ---------------------------------------------------------------------------
-# Extract relationships
-# ---------------------------------------------------------------------------
 
 def extract_relationships(
     source_conn: pyodbc.Connection,
 ) -> pd.DataFrame:
 
-    relationships_query = """
+    query = """
     SELECT
         fk.name AS CONSTRAINT_NAME,
 
@@ -394,7 +468,9 @@ def extract_relationships(
 
         child_schema.name AS CHILD_SCHEMA,
         child_table.name AS CHILD_TABLE,
-        child_column.name AS CHILD_COLUMN
+        child_column.name AS CHILD_COLUMN,
+
+        fkc.constraint_column_id AS COLUMN_ORDINAL
 
     FROM sys.foreign_keys fk
 
@@ -428,336 +504,668 @@ def extract_relationships(
         fkc.constraint_column_id;
     """
 
-    relationships = pd.read_sql(
-        relationships_query,
-        source_conn,
+    cursor = source_conn.cursor()
+
+    cursor.execute(query)
+
+    rows = cursor.fetchall()
+
+    columns = [
+        "CONSTRAINT_NAME",
+        "PARENT_SCHEMA",
+        "PARENT_TABLE",
+        "PARENT_COLUMN",
+        "CHILD_SCHEMA",
+        "CHILD_TABLE",
+        "CHILD_COLUMN",
+        "COLUMN_ORDINAL",
+    ]
+
+    relationships = pd.DataFrame.from_records(
+        rows,
+        columns=columns,
     )
 
     logging.info(
-        "Extracted %d relationship column mappings from source database",
+        "Extracted %d FK column mappings",
         len(relationships),
     )
 
     return relationships
 
 
-# ---------------------------------------------------------------------------
-# Load tables
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# ADD STABLE SOURCE KEYS
+# ===========================================================================
+
+
+def enrich_tables_with_source_keys(
+    tables: pd.DataFrame,
+    server_name: str,
+    database_name: str,
+) -> pd.DataFrame:
+
+    tables = tables.copy()
+
+    tables["SourceObjectKey"] = tables.apply(
+        lambda row: build_source_object_key(
+            SOURCE_SYSTEM,
+            server_name,
+            database_name,
+            row["TABLE_SCHEMA"],
+            row["TABLE_NAME"],
+        ),
+        axis=1,
+    )
+
+    return tables
+
+
+def enrich_columns_with_source_keys(
+    columns: pd.DataFrame,
+    server_name: str,
+    database_name: str,
+) -> pd.DataFrame:
+
+    columns = columns.copy()
+
+    columns["SourceColumnKey"] = columns.apply(
+        lambda row: build_source_column_key(
+            SOURCE_SYSTEM,
+            server_name,
+            database_name,
+            row["TABLE_SCHEMA"],
+            row["TABLE_NAME"],
+            row["COLUMN_NAME"],
+        ),
+        axis=1,
+    )
+
+    return columns
+
+
+# ===========================================================================
+# EXISTING REPOSITORY LOOKUPS
+# ===========================================================================
+
+
+def load_existing_tables(
+    cursor: pyodbc.Cursor,
+    database_id: int,
+) -> dict[str, int]:
+
+    cursor.execute(
+        """
+        SELECT
+            TableID,
+            SourceObjectKey
+        FROM dbo.MetadataTable
+        WHERE DatabaseID = ?
+          AND SourceObjectKey IS NOT NULL
+        """,
+        database_id,
+    )
+
+    lookup = {}
+
+    for table_id, source_object_key in cursor.fetchall():
+
+        lookup[str(source_object_key)] = int(table_id)
+
+    return lookup
+
+
+def load_existing_columns(
+    cursor: pyodbc.Cursor,
+    database_id: int,
+) -> dict[str, int]:
+
+    cursor.execute(
+        """
+        SELECT
+            c.ColumnID,
+            c.SourceColumnKey
+        FROM dbo.MetadataColumn c
+        INNER JOIN dbo.MetadataTable t
+            ON c.TableID = t.TableID
+        WHERE t.DatabaseID = ?
+          AND c.SourceColumnKey IS NOT NULL
+        """,
+        database_id,
+    )
+
+    lookup = {}
+
+    for column_id, source_column_key in cursor.fetchall():
+
+        lookup[str(source_column_key)] = int(column_id)
+
+    return lookup
+
+
+# ===========================================================================
+# LOAD TABLES
+# ===========================================================================
+
 
 def load_tables(
     cursor: pyodbc.Cursor,
     database_id: int,
     tables: pd.DataFrame,
-) -> int:
+    server_name: str,
+    database_name: str,
+) -> tuple[dict[str, int], int, int]:
 
-    existing_tables = {}
+    logging.info(
+        "Loading source tables..."
+    )
 
-    cursor.execute(
-        """
-        SELECT
-            TableID,
-            SchemaName,
-            TableName
-        FROM MetadataTable
-        WHERE DatabaseID = ?
-        """,
+    existing = load_existing_tables(
+        cursor,
         database_id,
     )
 
-    for table_id, schema_name, table_name in cursor.fetchall():
-        existing_tables[
-            (schema_name, table_name)
-        ] = table_id
+    inserted = 0
+    updated = 0
 
-    table_inserts = 0
+    table_lookup = dict(existing)
+
+    pending_inserts = []
 
     for _, row in tables.iterrows():
 
-        key = (
-            row["TABLE_SCHEMA"],
-            row["TABLE_NAME"],
+        source_object_key = clean_value(
+            row["SourceObjectKey"]
         )
 
-        if key in existing_tables:
-            continue
+        schema_name = clean_value(
+            row["TABLE_SCHEMA"]
+        )
 
-        cursor.execute(
-            """
-            INSERT INTO MetadataTable
-            (
-                DatabaseID,
-                SchemaName,
-                TableName,
-                TableType
+        table_name = clean_value(
+            row["TABLE_NAME"]
+        )
+
+        table_type = clean_value(
+            row["TABLE_TYPE"]
+        )
+
+        if source_object_key in existing:
+
+            table_id = existing[source_object_key]
+
+            cursor.execute(
+                """
+                UPDATE dbo.MetadataTable
+                SET
+                    SchemaName = ?,
+                    TableName = ?,
+                    TableType = ?
+                WHERE TableID = ?
+                """,
+                schema_name,
+                table_name,
+                table_type,
+                table_id,
             )
-            VALUES (?, ?, ?, ?)
-            """,
-            database_id,
-            row["TABLE_SCHEMA"],
-            row["TABLE_NAME"],
-            row["TABLE_TYPE"],
-        )
 
-        table_inserts += 1
+            updated += 1
 
-    cursor.connection.commit()
+        else:
 
-    logging.info(
-        "Inserted %d new tables into metadata repository",
-        table_inserts,
-    )
+            pending_inserts.append(
+                (
+                    database_id,
+                    schema_name,
+                    table_name,
+                    table_type,
+                    source_object_key,
+                )
+            )
 
-    return table_inserts
+    # -----------------------------------------------------------------------
+    # Batch inserts
+    # -----------------------------------------------------------------------
 
+    for start in range(
+        0,
+        len(pending_inserts),
+        BATCH_SIZE,
+    ):
 
-# ---------------------------------------------------------------------------
-# Table lookup
-# ---------------------------------------------------------------------------
+        batch = pending_inserts[
+            start:start + BATCH_SIZE
+        ]
 
-def build_table_lookup(
-    cursor: pyodbc.Cursor,
-    database_id: int,
-) -> dict[tuple[str, str], int]:
+        for row in batch:
 
-    cursor.execute(
-        """
-        SELECT
-            TableID,
-            SchemaName,
-            TableName
-        FROM MetadataTable
-        WHERE DatabaseID = ?
-        """,
+            cursor.execute(
+                """
+                INSERT INTO dbo.MetadataTable
+                (
+                    DatabaseID,
+                    SchemaName,
+                    TableName,
+                    TableType,
+                    SourceObjectKey
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                *row,
+            )
+
+        cursor.connection.commit()
+
+    inserted = len(pending_inserts)
+
+    # -----------------------------------------------------------------------
+    # Rebuild lookup once after inserts
+    # -----------------------------------------------------------------------
+
+    table_lookup = load_existing_tables(
+        cursor,
         database_id,
     )
 
-    return {
-        (schema_name, table_name): table_id
-        for table_id, schema_name, table_name
-        in cursor.fetchall()
-    }
+    logging.info(
+        "Tables: inserted=%d updated=%d total=%d",
+        inserted,
+        updated,
+        len(table_lookup),
+    )
+
+    return (
+        table_lookup,
+        inserted,
+        updated,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Load columns
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# LOAD COLUMNS
+# ===========================================================================
+
 
 def load_columns(
     cursor: pyodbc.Cursor,
     database_id: int,
     columns: pd.DataFrame,
-) -> int:
+    table_lookup: dict[str, int],
+    server_name: str,
+    database_name: str,
+) -> tuple[dict[str, int], int, int, int]:
 
-    table_lookup = build_table_lookup(
+    logging.info(
+        "Loading source columns..."
+    )
+
+    existing = load_existing_columns(
         cursor,
         database_id,
     )
 
-    existing_columns = {}
+    column_lookup = dict(existing)
+
+    inserted = 0
+    updated = 0
+    unresolved_tables = 0
+
+    pending_inserts = []
+
+    for _, row in columns.iterrows():
+
+        source_object_key = build_source_object_key(
+            SOURCE_SYSTEM,
+            server_name,
+            database_name,
+            row["TABLE_SCHEMA"],
+            row["TABLE_NAME"],
+        )
+
+        table_id = table_lookup.get(
+            source_object_key
+        )
+
+        if table_id is None:
+
+            unresolved_tables += 1
+
+            logging.warning(
+                "Cannot resolve table for column %s.%s.%s",
+                clean_value(row["TABLE_SCHEMA"]),
+                clean_value(row["TABLE_NAME"]),
+                clean_value(row["COLUMN_NAME"]),
+            )
+
+            continue
+
+        source_column_key = clean_value(
+            row["SourceColumnKey"]
+        )
+
+        column_name = clean_value(
+            row["COLUMN_NAME"]
+        )
+
+        data_type = clean_value(
+            row["DATA_TYPE"]
+        )
+
+        max_length = nullable_int(
+            row["CHARACTER_MAXIMUM_LENGTH"]
+        )
+
+        is_nullable = clean_value(
+            row["IS_NULLABLE"]
+        )
+
+        if source_column_key in existing:
+
+            column_id = existing[source_column_key]
+
+            cursor.execute(
+                """
+                UPDATE dbo.MetadataColumn
+                SET
+                    TableID = ?,
+                    ColumnName = ?,
+                    DataType = ?,
+                    MaxLength = ?,
+                    IsNullable = ?
+                WHERE ColumnID = ?
+                """,
+                table_id,
+                column_name,
+                data_type,
+                max_length,
+                is_nullable,
+                column_id,
+            )
+
+            updated += 1
+
+        else:
+
+            pending_inserts.append(
+                (
+                    table_id,
+                    column_name,
+                    data_type,
+                    max_length,
+                    is_nullable,
+                    source_column_key,
+                )
+            )
+
+    # -----------------------------------------------------------------------
+    # Batch insert columns
+    # -----------------------------------------------------------------------
+
+    for start in range(
+        0,
+        len(pending_inserts),
+        BATCH_SIZE,
+    ):
+
+        batch = pending_inserts[
+            start:start + BATCH_SIZE
+        ]
+
+        for row in batch:
+
+            cursor.execute(
+                """
+                INSERT INTO dbo.MetadataColumn
+                (
+                    TableID,
+                    ColumnName,
+                    DataType,
+                    MaxLength,
+                    IsNullable,
+                    SourceColumnKey
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                *row,
+            )
+
+        cursor.connection.commit()
+
+    inserted = len(pending_inserts)
+
+    # -----------------------------------------------------------------------
+    # Reload complete column lookup
+    # -----------------------------------------------------------------------
+
+    column_lookup = load_existing_columns(
+        cursor,
+        database_id,
+    )
+
+    logging.info(
+        "Columns: inserted=%d updated=%d total=%d unresolved_tables=%d",
+        inserted,
+        updated,
+        len(column_lookup),
+        unresolved_tables,
+    )
+
+    return (
+        column_lookup,
+        inserted,
+        updated,
+        unresolved_tables,
+    )
+
+
+# ===========================================================================
+# RELATIONSHIP LOOKUPS
+# ===========================================================================
+
+
+def load_existing_relationships(
+    cursor: pyodbc.Cursor,
+    database_id: int,
+) -> dict[tuple[str, int, int], int]:
 
     cursor.execute(
         """
         SELECT
-            c.ColumnID,
-            t.SchemaName,
-            t.TableName,
-            c.ColumnName
-        FROM MetadataColumn c
-        INNER JOIN MetadataTable t
-            ON c.TableID = t.TableID
-        WHERE t.DatabaseID = ?
+            RelationshipID,
+            ConstraintName,
+            ParentTableID,
+            ChildTableID
+        FROM dbo.MetadataRelationship
+        WHERE DatabaseID = ?
         """,
         database_id,
     )
 
+    lookup = {}
+
     for (
-        column_id,
-        schema_name,
-        table_name,
-        column_name,
+        relationship_id,
+        constraint_name,
+        parent_table_id,
+        child_table_id,
     ) in cursor.fetchall():
 
-        existing_columns[
-            (
-                schema_name,
-                table_name,
-                column_name,
-            )
-        ] = column_id
-
-    column_inserts = 0
-
-    for _, row in columns.iterrows():
-
         key = (
-            row["TABLE_SCHEMA"],
-            row["TABLE_NAME"],
-            row["COLUMN_NAME"],
+            clean_value(constraint_name),
+            int(parent_table_id),
+            int(child_table_id),
         )
 
-        table_key = (
-            row["TABLE_SCHEMA"],
-            row["TABLE_NAME"],
-        )
+        lookup[key] = int(relationship_id)
 
-        table_id = table_lookup.get(table_key)
+    return lookup
 
-        if not table_id or key in existing_columns:
-            continue
 
-        max_length = row["CHARACTER_MAXIMUM_LENGTH"]
+def load_existing_relationship_columns(
+    cursor: pyodbc.Cursor,
+) -> set[tuple[int, int, int, int]]:
 
-        max_length = (
-            None
-            if pd.isna(max_length)
-            else int(max_length)
-        )
-
-        cursor.execute(
-            """
-            INSERT INTO MetadataColumn
-            (
-                TableID,
-                ColumnName,
-                DataType,
-                MaxLength,
-                IsNullable
-            )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            table_id,
-            str(row["COLUMN_NAME"]),
-            str(row["DATA_TYPE"]),
-            max_length,
-            str(row["IS_NULLABLE"]),
-        )
-
-        column_inserts += 1
-
-    cursor.connection.commit()
-
-    logging.info(
-        "Inserted %d new columns into metadata repository",
-        column_inserts,
+    cursor.execute(
+        """
+        SELECT
+            RelationshipID,
+            ParentColumnID,
+            ChildColumnID,
+            ColumnOrdinal
+        FROM dbo.MetadataRelationshipColumn
+        """
     )
 
-    return column_inserts
+    return {
+        (
+            int(relationship_id),
+            int(parent_column_id),
+            int(child_column_id),
+            int(column_ordinal),
+        )
+        for (
+            relationship_id,
+            parent_column_id,
+            child_column_id,
+            column_ordinal,
+        ) in cursor.fetchall()
+    }
 
 
-# ---------------------------------------------------------------------------
-# Load relationships
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# LOAD RELATIONSHIPS
+# ===========================================================================
+
 
 def load_relationships(
     cursor: pyodbc.Cursor,
     database_id: int,
     relationships: pd.DataFrame,
-) -> int:
+    table_lookup: dict[str, int],
+    column_lookup: dict[str, int],
+    server_name: str,
+    database_name: str,
+) -> tuple[int, int, int]:
 
-    table_lookup = build_table_lookup(
+    logging.info(
+        "Loading source relationships..."
+    )
+
+    existing_relationships = load_existing_relationships(
         cursor,
         database_id,
     )
 
-    # Existing relationships are identified by
-    # constraint name + database.
-    cursor.execute(
-        """
-        SELECT
-            r.RelationshipID,
-            r.ConstraintName
-        FROM MetadataRelationship r
-        WHERE r.DatabaseID = ?
-        """,
-        database_id,
+    existing_relationship_columns = (
+        load_existing_relationship_columns(
+            cursor
+        )
     )
 
-    existing_relationships = {
-        constraint_name: relationship_id
-        for relationship_id, constraint_name
-        in cursor.fetchall()
-        if constraint_name is not None
-    }
+    relationship_inserted = 0
+    relationship_column_inserted = 0
+    unresolved = 0
 
-    # Metadata column lookup
-    column_lookup = {}
-
-    cursor.execute(
-        """
-        SELECT
-            c.ColumnID,
-            t.SchemaName,
-            t.TableName,
-            c.ColumnName
-        FROM MetadataColumn c
-        INNER JOIN MetadataTable t
-            ON c.TableID = t.TableID
-        WHERE t.DatabaseID = ?
-        """,
-        database_id,
+    relationship_lookup = dict(
+        existing_relationships
     )
-
-    for (
-        column_id,
-        schema_name,
-        table_name,
-        column_name,
-    ) in cursor.fetchall():
-
-        column_lookup[
-            (
-                schema_name,
-                table_name,
-                column_name,
-            )
-        ] = column_id
-
-    relationship_inserts = 0
-    relationship_column_inserts = 0
 
     for _, row in relationships.iterrows():
 
-        constraint_name = row["CONSTRAINT_NAME"]
+        parent_object_key = build_source_object_key(
+            SOURCE_SYSTEM,
+            server_name,
+            database_name,
+            row["PARENT_SCHEMA"],
+            row["PARENT_TABLE"],
+        )
+
+        child_object_key = build_source_object_key(
+            SOURCE_SYSTEM,
+            server_name,
+            database_name,
+            row["CHILD_SCHEMA"],
+            row["CHILD_TABLE"],
+        )
 
         parent_table_id = table_lookup.get(
-            (
-                row["PARENT_SCHEMA"],
-                row["PARENT_TABLE"],
-            )
+            parent_object_key
         )
 
         child_table_id = table_lookup.get(
-            (
-                row["CHILD_SCHEMA"],
-                row["CHILD_TABLE"],
-            )
+            child_object_key
         )
 
-        if not parent_table_id or not child_table_id:
+        parent_column_key = build_source_column_key(
+            SOURCE_SYSTEM,
+            server_name,
+            database_name,
+            row["PARENT_SCHEMA"],
+            row["PARENT_TABLE"],
+            row["PARENT_COLUMN"],
+        )
+
+        child_column_key = build_source_column_key(
+            SOURCE_SYSTEM,
+            server_name,
+            database_name,
+            row["CHILD_SCHEMA"],
+            row["CHILD_TABLE"],
+            row["CHILD_COLUMN"],
+        )
+
+        parent_column_id = column_lookup.get(
+            parent_column_key
+        )
+
+        child_column_id = column_lookup.get(
+            child_column_key
+        )
+
+        if (
+            parent_table_id is None
+            or child_table_id is None
+            or parent_column_id is None
+            or child_column_id is None
+        ):
+
+            unresolved += 1
 
             logging.warning(
-                "Could not find tables for relationship %s",
-                constraint_name,
+                "Unresolved relationship: %s.%s -> %s.%s",
+                clean_value(row["PARENT_TABLE"]),
+                clean_value(row["PARENT_COLUMN"]),
+                clean_value(row["CHILD_TABLE"]),
+                clean_value(row["CHILD_COLUMN"]),
             )
 
             continue
 
-# ---------------------------------------------------------------
-# Create or retrieve relationship
-# ---------------------------------------------------------------
-
-        relationship_id = existing_relationships.get(
-            constraint_name
+        constraint_name = clean_value(
+            row["CONSTRAINT_NAME"]
         )
+
+        relationship_key = (
+            constraint_name,
+            parent_table_id,
+            child_table_id,
+        )
+
+        relationship_id = relationship_lookup.get(
+            relationship_key
+        )
+
+        # -------------------------------------------------------------------
+        # Create relationship if necessary
+        # -------------------------------------------------------------------
 
         if relationship_id is None:
 
             cursor.execute(
                 """
-                INSERT INTO MetadataRelationship
-             (
-                 DatabaseID,
+                INSERT INTO dbo.MetadataRelationship
+                (
+                    DatabaseID,
                     ParentTableID,
                     ParentColumnID,
                     ChildTableID,
@@ -768,112 +1176,74 @@ def load_relationships(
                 """,
                 database_id,
                 parent_table_id,
-                None,
+                parent_column_id,
                 child_table_id,
-                None,
+                child_column_id,
                 constraint_name,
             )
 
             cursor.connection.commit()
 
+            # Resolve ID using deterministic relationship attributes.
             cursor.execute(
                 """
-                SELECT MAX(RelationshipID)
-                FROM MetadataRelationship
-             WHERE DatabaseID = ?
-               AND ConstraintName = ?
-             """,
-             database_id,
+                SELECT RelationshipID
+                FROM dbo.MetadataRelationship
+                WHERE DatabaseID = ?
+                  AND ConstraintName = ?
+                  AND ParentTableID = ?
+                  AND ChildTableID = ?
+                ORDER BY RelationshipID DESC
+                """,
+                database_id,
                 constraint_name,
+                parent_table_id,
+                child_table_id,
             )
 
-            relationship_result = cursor.fetchone()
+            result = cursor.fetchone()
 
-            if not relationship_result or relationship_result[0] is None:
+            if result is None:
+
                 raise RuntimeError(
-                  f"Failed to retrieve RelationshipID for constraint "
-                 f"{constraint_name}."
+                    "Could not resolve newly inserted "
+                    f"relationship {constraint_name}."
                 )
 
-            relationship_id = int(relationship_result[0])
+            relationship_id = int(
+                result[0]
+            )
 
-            existing_relationships[
-                constraint_name
+            relationship_lookup[
+                relationship_key
             ] = relationship_id
 
-            relationship_inserts += 1
+            relationship_inserted += 1
 
-# ---------------------------------------------------------------
-# Column mapping
-# ---------------------------------------------------------------
+        # -------------------------------------------------------------------
+        # Relationship column mapping
+        # -------------------------------------------------------------------
 
-        parent_column = str(
-            row["PARENT_COLUMN"]
-        ).strip()
-
-        child_column = str(
-            row["CHILD_COLUMN"]
-        ).strip()
-
-        parent_column_id = column_lookup.get(
-            (
-                row["PARENT_SCHEMA"],
-                row["PARENT_TABLE"],
-                parent_column,
-            )
+        ordinal = int(
+            row["COLUMN_ORDINAL"]
         )
 
-        child_column_id = column_lookup.get(
-            (
-                row["CHILD_SCHEMA"],
-                row["CHILD_TABLE"],
-                child_column,
-            )
-        )
-
-        if not parent_column_id or not child_column_id:
-
-            logging.warning(
-                "Could not find columns for relationship %s: %s -> %s",
-                constraint_name,
-                parent_column,
-                child_column,
-            )
-
-            continue
-
-        # Determine ordinal based on the source FK metadata.
-        cursor.execute(
-            """
-            SELECT COUNT(*)
-            FROM MetadataRelationshipColumn
-            WHERE RelationshipID = ?
-            """,
-            relationship_id,
-        )
-
-        ordinal = cursor.fetchone()[0] + 1
-
-        # Avoid duplicate mapping.
-        cursor.execute(
-            """
-            SELECT 1
-            FROM MetadataRelationshipColumn
-            WHERE RelationshipID = ?
-              AND ParentColumnID = ?
-              AND ChildColumnID = ?
-            """,
+        relationship_column_key = (
             relationship_id,
             parent_column_id,
             child_column_id,
+            ordinal,
         )
 
-        if cursor.fetchone():
+        if (
+            relationship_column_key
+            in existing_relationship_columns
+        ):
             continue
 
         cursor.execute(
             """
-            INSERT INTO MetadataRelationshipColumn
+            INSERT INTO dbo.MetadataRelationshipColumn
             (
                 RelationshipID,
                 ParentColumnID,
@@ -888,28 +1258,470 @@ def load_relationships(
             ordinal,
         )
 
-        relationship_column_inserts += 1
+        existing_relationship_columns.add(
+            relationship_column_key
+        )
+
+        relationship_column_inserted += 1
 
     cursor.connection.commit()
 
     logging.info(
-        "Inserted %d new relationships into metadata repository",
-        relationship_inserts,
+        "Relationships: inserted=%d",
+        relationship_inserted,
     )
 
     logging.info(
-        "Inserted %d new relationship column mappings into metadata repository",
-        relationship_column_inserts,
+        "Relationship column mappings: inserted=%d",
+        relationship_column_inserted,
     )
 
-    return relationship_inserts
+    logging.info(
+        "Unresolved relationship mappings: %d",
+        unresolved,
+    )
+
+    return (
+        relationship_inserted,
+        relationship_column_inserted,
+        unresolved,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Write AI-friendly relationship CSV
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# VALIDATION
+# ===========================================================================
 
-def write_ai_relationships_csv(
+
+def validate_repository(
+    cursor: pyodbc.Cursor,
+    database_id: int,
+    expected_tables: int,
+    expected_columns: int,
+    expected_relationship_columns: int,
+) -> dict:
+
+    logging.info(
+        ""
+    )
+
+    logging.info(
+        "=" * 70
+    )
+
+    logging.info(
+        "V6 SQL REPOSITORY VALIDATION"
+    )
+
+    logging.info(
+        "=" * 70
+    )
+
+    # -----------------------------------------------------------------------
+    # Table count
+    # -----------------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM dbo.MetadataTable
+        WHERE DatabaseID = ?
+        """,
+        database_id,
+    )
+
+    table_count = int(
+        cursor.fetchone()[0]
+    )
+
+    # -----------------------------------------------------------------------
+    # Column count
+    # -----------------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM dbo.MetadataColumn c
+        INNER JOIN dbo.MetadataTable t
+            ON c.TableID = t.TableID
+        WHERE t.DatabaseID = ?
+        """,
+        database_id,
+    )
+
+    column_count = int(
+        cursor.fetchone()[0]
+    )
+
+    # -----------------------------------------------------------------------
+    # Relationship count
+    # -----------------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM dbo.MetadataRelationship
+        WHERE DatabaseID = ?
+        """,
+        database_id,
+    )
+
+    relationship_count = int(
+        cursor.fetchone()[0]
+    )
+
+    # -----------------------------------------------------------------------
+    # Relationship column count
+    # -----------------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM dbo.MetadataRelationshipColumn rc
+        INNER JOIN dbo.MetadataRelationship r
+            ON rc.RelationshipID = r.RelationshipID
+        WHERE r.DatabaseID = ?
+        """,
+        database_id,
+    )
+
+    relationship_column_count = int(
+        cursor.fetchone()[0]
+    )
+
+    # -----------------------------------------------------------------------
+    # Source object key coverage
+    # -----------------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM dbo.MetadataTable
+        WHERE DatabaseID = ?
+          AND SourceObjectKey IS NOT NULL
+          AND SourceObjectKey <> ''
+        """,
+        database_id,
+    )
+
+    tables_with_keys = int(
+        cursor.fetchone()[0]
+    )
+
+    # -----------------------------------------------------------------------
+    # Source column key coverage
+    # -----------------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM dbo.MetadataColumn c
+        INNER JOIN dbo.MetadataTable t
+            ON c.TableID = t.TableID
+        WHERE t.DatabaseID = ?
+          AND c.SourceColumnKey IS NOT NULL
+          AND c.SourceColumnKey <> ''
+        """,
+        database_id,
+    )
+
+    columns_with_keys = int(
+        cursor.fetchone()[0]
+    )
+
+    # -----------------------------------------------------------------------
+    # Duplicate source object keys
+    # -----------------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM
+        (
+            SELECT SourceObjectKey
+            FROM dbo.MetadataTable
+            WHERE DatabaseID = ?
+              AND SourceObjectKey IS NOT NULL
+            GROUP BY SourceObjectKey
+            HAVING COUNT(*) > 1
+        ) d
+        """,
+        database_id,
+    )
+
+    duplicate_object_keys = int(
+        cursor.fetchone()[0]
+    )
+
+    # -----------------------------------------------------------------------
+    # Duplicate source column keys
+    # -----------------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM
+        (
+            SELECT c.SourceColumnKey
+            FROM dbo.MetadataColumn c
+            INNER JOIN dbo.MetadataTable t
+                ON c.TableID = t.TableID
+            WHERE t.DatabaseID = ?
+              AND c.SourceColumnKey IS NOT NULL
+            GROUP BY c.SourceColumnKey
+            HAVING COUNT(*) > 1
+        ) d
+        """,
+        database_id,
+    )
+
+    duplicate_column_keys = int(
+        cursor.fetchone()[0]
+    )
+
+    # -----------------------------------------------------------------------
+    # Broken table references
+    # -----------------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM dbo.MetadataRelationship r
+        LEFT JOIN dbo.MetadataTable pt
+            ON r.ParentTableID = pt.TableID
+        LEFT JOIN dbo.MetadataTable ct
+            ON r.ChildTableID = ct.TableID
+        WHERE r.DatabaseID = ?
+          AND
+          (
+              pt.TableID IS NULL
+              OR ct.TableID IS NULL
+          )
+        """,
+        database_id,
+    )
+
+    broken_relationships = int(
+        cursor.fetchone()[0]
+    )
+
+    # -----------------------------------------------------------------------
+    # Broken column references
+    # -----------------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM dbo.MetadataRelationshipColumn rc
+        INNER JOIN dbo.MetadataRelationship r
+            ON rc.RelationshipID = r.RelationshipID
+        LEFT JOIN dbo.MetadataColumn pc
+            ON rc.ParentColumnID = pc.ColumnID
+        LEFT JOIN dbo.MetadataColumn cc
+            ON rc.ChildColumnID = cc.ColumnID
+        WHERE r.DatabaseID = ?
+          AND
+          (
+              pc.ColumnID IS NULL
+              OR cc.ColumnID IS NULL
+          )
+        """,
+        database_id,
+    )
+
+    broken_relationship_columns = int(
+        cursor.fetchone()[0]
+    )
+
+    # -----------------------------------------------------------------------
+    # Expected counts
+    # -----------------------------------------------------------------------
+
+    counts_match = (
+        table_count == expected_tables
+        and column_count == expected_columns
+        and relationship_column_count
+        == expected_relationship_columns
+    )
+
+    key_coverage_valid = (
+        tables_with_keys == table_count
+        and columns_with_keys == column_count
+    )
+
+    references_valid = (
+        broken_relationships == 0
+        and broken_relationship_columns == 0
+    )
+
+    uniqueness_valid = (
+        duplicate_object_keys == 0
+        and duplicate_column_keys == 0
+    )
+
+    validation_passed = (
+        counts_match
+        and key_coverage_valid
+        and references_valid
+        and uniqueness_valid
+    )
+
+    # -----------------------------------------------------------------------
+    # Output
+    # -----------------------------------------------------------------------
+
+    logging.info(
+        "DatabaseID:                         %s",
+        database_id,
+    )
+
+    logging.info(
+        "Tables:                              %d",
+        table_count,
+    )
+
+    logging.info(
+        "Columns:                             %d",
+        column_count,
+    )
+
+    logging.info(
+        "Relationships:                       %d",
+        relationship_count,
+    )
+
+    logging.info(
+        "Relationship column mappings:        %d",
+        relationship_column_count,
+    )
+
+    logging.info(
+        "Expected source tables:              %d",
+        expected_tables,
+    )
+
+    logging.info(
+        "Expected source columns:             %d",
+        expected_columns,
+    )
+
+    logging.info(
+        "Expected FK mappings:                %d",
+        expected_relationship_columns,
+    )
+
+    logging.info(
+        "Tables with SourceObjectKey:          %d/%d",
+        tables_with_keys,
+        table_count,
+    )
+
+    logging.info(
+        "Columns with SourceColumnKey:         %d/%d",
+        columns_with_keys,
+        column_count,
+    )
+
+    logging.info(
+        "Duplicate SourceObjectKeys:           %d",
+        duplicate_object_keys,
+    )
+
+    logging.info(
+        "Duplicate SourceColumnKeys:           %d",
+        duplicate_column_keys,
+    )
+
+    logging.info(
+        "Broken relationship table refs:       %d",
+        broken_relationships,
+    )
+
+    logging.info(
+        "Broken relationship column refs:      %d",
+        broken_relationship_columns,
+    )
+
+    logging.info(
+        "Counts match source:                  %s",
+        "YES" if counts_match else "NO",
+    )
+
+    logging.info(
+        "Source key coverage valid:            %s",
+        "YES" if key_coverage_valid else "NO",
+    )
+
+    logging.info(
+        "Reference integrity valid:            %s",
+        "YES" if references_valid else "NO",
+    )
+
+    logging.info(
+        "Source key uniqueness valid:          %s",
+        "YES" if uniqueness_valid else "NO",
+    )
+
+    logging.info(
+        "=" * 70
+    )
+
+    if validation_passed:
+
+        logging.info(
+            "V6 SQL REPOSITORY VALIDATION: PASSED"
+        )
+
+    else:
+
+        logging.error(
+            "V6 SQL REPOSITORY VALIDATION: FAILED"
+        )
+
+    logging.info(
+        "=" * 70
+    )
+
+    return {
+        "passed": validation_passed,
+        "tables": table_count,
+        "columns": column_count,
+        "relationships": relationship_count,
+        "relationship_columns": relationship_column_count,
+        "tables_with_keys": tables_with_keys,
+        "columns_with_keys": columns_with_keys,
+        "duplicate_object_keys": duplicate_object_keys,
+        "duplicate_column_keys": duplicate_column_keys,
+        "broken_relationships": broken_relationships,
+        "broken_relationship_columns": broken_relationship_columns,
+    }
+
+
+# ===========================================================================
+# CSV OUTPUT
+# ===========================================================================
+
+
+def write_csv(
+    dataframe: pd.DataFrame,
+    output_dir: Path,
+    filename: str,
+) -> None:
+
+    path = output_dir / filename
+
+    dataframe.to_csv(
+        path,
+        index=False,
+    )
+
+    logging.info(
+        "Wrote %s",
+        path,
+    )
+
+
+def write_ai_relationship_csv(
     repo_conn: pyodbc.Connection,
     database_id: int,
     output_dir: Path,
@@ -917,18 +1729,25 @@ def write_ai_relationships_csv(
 
     query = """
     SELECT
-        r.ConstraintName AS ConstraintName,
+        r.ConstraintName,
 
         pt.SchemaName AS ParentSchema,
         pt.TableName AS ParentTable,
 
+        pc.ColumnName AS ParentColumn,
+
         ct.SchemaName AS ChildSchema,
         ct.TableName AS ChildTable,
 
-        pc.ColumnName AS ParentColumn,
         cc.ColumnName AS ChildColumn,
 
-        rc.ColumnOrdinal AS ColumnOrdinal
+        rc.ColumnOrdinal,
+
+        pt.SourceObjectKey AS ParentSourceObjectKey,
+        ct.SourceObjectKey AS ChildSourceObjectKey,
+
+        pc.SourceColumnKey AS ParentSourceColumnKey,
+        cc.SourceColumnKey AS ChildSourceColumnKey
 
     FROM dbo.MetadataRelationship r
 
@@ -956,120 +1775,130 @@ def write_ai_relationships_csv(
         rc.ColumnOrdinal;
     """
 
-    relationships = pd.read_sql(
+    cursor = repo_conn.cursor()
+
+    cursor.execute(
         query,
-        repo_conn,
-        params=[database_id],
+        database_id,
     )
 
-    output_path = output_dir / "metadata_relationships_ai.csv"
+    rows = cursor.fetchall()
 
-    relationships.to_csv(
-        output_path,
-        index=False,
+    columns = [
+        "ConstraintName",
+        "ParentSchema",
+        "ParentTable",
+        "ParentColumn",
+        "ChildSchema",
+        "ChildTable",
+        "ChildColumn",
+        "ColumnOrdinal",
+        "ParentSourceObjectKey",
+        "ChildSourceObjectKey",
+        "ParentSourceColumnKey",
+        "ChildSourceColumnKey",
+    ]
+
+    dataframe = pd.DataFrame.from_records(
+        rows,
+        columns=columns,
     )
 
-    logging.info(
-        "Wrote AI-friendly relationship CSV: %s",
-        output_path,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Write metadata CSV
-# ---------------------------------------------------------------------------
-
-def write_metadata_csv(
-    output_dir: Path,
-    filename: str,
-    dataframe: pd.DataFrame,
-) -> None:
-
-    destination = output_dir / filename
-
-    dataframe.to_csv(
-        destination,
-        index=False,
-    )
-
-    logging.info(
-        "Wrote metadata CSV: %s",
-        destination,
+    write_csv(
+        dataframe,
+        output_dir,
+        "metadata_relationships_ai_v6.csv",
     )
 
 
-# ---------------------------------------------------------------------------
-# Arguments
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# ARGUMENTS
+# ===========================================================================
+
 
 def parse_arguments() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Extract metadata from SQL Server "
-            "and load it into a Fabric Warehouse metadata repository."
+            "V6 reusable SQL Server metadata extractor "
+            "for Fabric Warehouse."
         )
     )
 
     parser.add_argument(
         "--server",
         default=DEFAULT_SERVER,
-        help="SQL Server source name",
+        help="Source SQL Server name.",
     )
 
     parser.add_argument(
         "--source-database",
         default=DEFAULT_SOURCE_DATABASE,
-        help="Source database name",
+        help="Source SQL Server database.",
     )
 
     parser.add_argument(
         "--repository-database",
-        default=DEFAULT_REPOSITORY_DATABASE,
-        help="Fabric Warehouse database name",
+        default=FABRIC_SQL_DATABASE,
+        help="Fabric Warehouse repository database.",
+    )
+
+    parser.add_argument(
+        "--repository-server",
+        default=FABRIC_SQL_SERVER,
+        help="Fabric Warehouse SQL endpoint.",
     )
 
     parser.add_argument(
         "--output-dir",
         default=DEFAULT_OUTPUT_DIR,
-        help="Directory for output CSV files",
+        help="Output directory for CSV files.",
     )
 
     parser.add_argument(
         "--driver",
         default=DEFAULT_DRIVER,
-        help="ODBC driver for SQL Server",
+        help="ODBC driver.",
+    )
+
+    parser.add_argument(
+        "--source-system",
+        default=SOURCE_SYSTEM,
+        help="Logical source-system identifier.",
     )
 
     return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# MAIN
+# ===========================================================================
+
 
 def main() -> int:
 
+    configure_logging()
+
     args = parse_arguments()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format=LOG_FORMAT,
+    output_dir = Path(
+        args.output_dir
     )
 
-    output_dir = Path(args.output_dir)
-
-    ensure_output_dir(output_dir)
+    ensure_output_dir(
+        output_dir
+    )
 
     source_conn = None
-    repo_conn = None
-    extraction_id = None
+    repository_conn = None
+
+    start_time = datetime.now()
 
     try:
 
-        # ---------------------------------------------------------------
-        # Connect to source database
-        # ---------------------------------------------------------------
+        # ===================================================================
+        # Connections
+        # ===================================================================
 
         source_conn = connect_to_source(
             args.driver,
@@ -1077,201 +1906,357 @@ def main() -> int:
             args.source_database,
         )
 
-        logging.info(
-            "Connected to source database %s on server %s",
-            args.source_database,
-            args.server,
-        )
-
-        # ---------------------------------------------------------------
-        # Connect to Fabric Warehouse
-        # ---------------------------------------------------------------
-
-        repo_conn = connect_to_fabric_warehouse(
+        repository_conn = connect_to_fabric_warehouse(
             args.driver,
-            FABRIC_SQL_SERVER,
+            args.repository_server,
             args.repository_database,
         )
 
-        logging.info(
-            "Connected to Fabric Warehouse %s",
-            args.repository_database,
-        )
+        repo_cursor = repository_conn.cursor()
 
-        repo_cursor = repo_conn.cursor()
+        # ===================================================================
+        # Database
+        # ===================================================================
 
-        # ---------------------------------------------------------------
-        # Get database ID
-        # ---------------------------------------------------------------
-
-        database_id = get_database_id(
+        database_id = get_or_create_database(
             repo_cursor,
             args.source_database,
             args.server,
         )
 
-        if database_id is None:
-
-            logging.info(
-                "Source database not found in repository; "
-                "inserting record"
-            )
-
-            database_id = insert_database(
-                repo_cursor,
-                args.source_database,
-                args.server,
-            )
-
         logging.info(
-            "Using DatabaseID %s",
+            "Using repository DatabaseID=%s",
             database_id,
         )
 
-        # ---------------------------------------------------------------
-        # Start extraction log
-        # ---------------------------------------------------------------
-
-        extraction_id = start_extraction_log(
-            repo_cursor,
-            database_id,
-        )
-
-        logging.info(
-            "Started extraction log %s",
-            extraction_id,
-        )
-
-        # ---------------------------------------------------------------
-        # Tables
-        # ---------------------------------------------------------------
+        # ===================================================================
+        # Extract
+        # ===================================================================
 
         tables = extract_tables(
             source_conn
         )
 
-        tables_loaded = load_tables(
-            repo_cursor,
-            database_id,
-            tables,
-        )
-
-        write_metadata_csv(
-            output_dir,
-            "tables_metadata.csv",
-            tables,
-        )
-
-        # ---------------------------------------------------------------
-        # Columns
-        # ---------------------------------------------------------------
-
         columns = extract_columns(
             source_conn
         )
-
-        columns_loaded = load_columns(
-            repo_cursor,
-            database_id,
-            columns,
-        )
-
-        write_metadata_csv(
-            output_dir,
-            "columns_metadata.csv",
-            columns,
-        )
-
-        # ---------------------------------------------------------------
-        # Relationships
-        # ---------------------------------------------------------------
 
         relationships = extract_relationships(
             source_conn
         )
 
-        relationships_loaded = load_relationships(
+        # ===================================================================
+        # Stable source keys
+        # ===================================================================
+
+        tables = enrich_tables_with_source_keys(
+            tables,
+            args.server,
+            args.source_database,
+        )
+
+        columns = enrich_columns_with_source_keys(
+            columns,
+            args.server,
+            args.source_database,
+        )
+
+        # ===================================================================
+        # CSV extraction snapshots
+        # ===================================================================
+
+        write_csv(
+            tables,
+            output_dir,
+            "tables_metadata_v6.csv",
+        )
+
+        write_csv(
+            columns,
+            output_dir,
+            "columns_metadata_v6.csv",
+        )
+
+        write_csv(
+            relationships,
+            output_dir,
+            "relationships_metadata_v6.csv",
+        )
+
+        # ===================================================================
+        # Load tables
+        # ===================================================================
+
+        (
+            table_lookup,
+            tables_inserted,
+            tables_updated,
+        ) = load_tables(
+            repo_cursor,
+            database_id,
+            tables,
+            args.server,
+            args.source_database,
+        )
+
+        # ===================================================================
+        # Load columns
+        # ===================================================================
+
+        (
+            column_lookup,
+            columns_inserted,
+            columns_updated,
+            unresolved_column_tables,
+        ) = load_columns(
+            repo_cursor,
+            database_id,
+            columns,
+            table_lookup,
+            args.server,
+            args.source_database,
+        )
+
+        # ===================================================================
+        # Load relationships
+        # ===================================================================
+
+        (
+            relationships_inserted,
+            relationship_columns_inserted,
+            unresolved_relationships,
+        ) = load_relationships(
             repo_cursor,
             database_id,
             relationships,
+            table_lookup,
+            column_lookup,
+            args.server,
+            args.source_database,
         )
 
-        write_metadata_csv(
-            output_dir,
-            "relationships_metadata.csv",
-            relationships,
-        )
+        # ===================================================================
+        # AI relationship snapshot
+        # ===================================================================
 
-        # ---------------------------------------------------------------
-        # AI-friendly relationship CSV
-        # ---------------------------------------------------------------
-
-        write_ai_relationships_csv(
-            repo_conn,
+        write_ai_relationship_csv(
+            repository_conn,
             database_id,
             output_dir,
         )
 
-        # ---------------------------------------------------------------
-        # Mark extraction as successful
-        # ---------------------------------------------------------------
+        # ===================================================================
+        # Validation
+        # ===================================================================
 
-        update_extraction_log(
+        validation = validate_repository(
             repo_cursor,
-            extraction_id,
-            "Success",
-            tables_loaded=tables_loaded,
-            columns_loaded=columns_loaded,
-            relationships_loaded=relationships_loaded,
+            database_id,
+            expected_tables=len(tables),
+            expected_columns=len(columns),
+            expected_relationship_columns=len(
+                relationships
+            ),
+        )
+
+        # ===================================================================
+        # Final summary
+        # ===================================================================
+
+        elapsed = (
+            datetime.now()
+            - start_time
+        ).total_seconds()
+
+        logging.info(
+            ""
         )
 
         logging.info(
-            "Extraction completed successfully"
+            "=" * 70
         )
 
-        return 0
+        logging.info(
+            "V6 SQL EXTRACTOR FINAL SUMMARY"
+        )
 
-    except Exception as exc:
+        logging.info(
+            "=" * 70
+        )
+
+        logging.info(
+            "Source database:                 %s",
+            args.source_database,
+        )
+
+        logging.info(
+            "Source server:                   %s",
+            args.server,
+        )
+
+        logging.info(
+            "Repository:                      %s",
+            args.repository_database,
+        )
+
+        logging.info(
+            "DatabaseID:                      %s",
+            database_id,
+        )
+
+        logging.info(
+            ""
+        )
+
+        logging.info(
+            "Source objects extracted:        %d",
+            len(tables),
+        )
+
+        logging.info(
+            "Source columns extracted:        %d",
+            len(columns),
+        )
+
+        logging.info(
+            "FK column mappings extracted:    %d",
+            len(relationships),
+        )
+
+        logging.info(
+            ""
+        )
+
+        logging.info(
+            "Tables inserted:                 %d",
+            tables_inserted,
+        )
+
+        logging.info(
+            "Tables updated:                  %d",
+            tables_updated,
+        )
+
+        logging.info(
+            "Columns inserted:               %d",
+            columns_inserted,
+        )
+
+        logging.info(
+            "Columns updated:                %d",
+            columns_updated,
+        )
+
+        logging.info(
+            "Relationships inserted:        %d",
+            relationships_inserted,
+        )
+
+        logging.info(
+            "Relationship mappings inserted: %d",
+            relationship_columns_inserted,
+        )
+
+        logging.info(
+            ""
+        )
+
+        logging.info(
+            "Unresolved column tables:        %d",
+            unresolved_column_tables,
+        )
+
+        logging.info(
+            "Unresolved relationships:       %d",
+            unresolved_relationships,
+        )
+
+        logging.info(
+            ""
+        )
+
+        logging.info(
+            "Validation:                     %s",
+            "PASSED" if validation["passed"]
+            else "FAILED",
+        )
+
+        logging.info(
+            "Elapsed time:                   %.2f seconds",
+            elapsed,
+        )
+
+        logging.info(
+            "=" * 70
+        )
+
+        if validation["passed"]:
+
+            logging.info(
+                "V6 SQL EXTRACTOR COMPLETED SUCCESSFULLY."
+            )
+
+            return 0
+
+        logging.error(
+            "V6 SQL EXTRACTOR COMPLETED WITH VALIDATION ERRORS."
+        )
+
+        return 1
+
+    except KeyboardInterrupt:
+
+        logging.error(
+            "SQL EXTRACTOR V2 INTERRUPTED BY USER."
+        )
+
+        return 130
+
+    except Exception:
 
         logging.exception(
-            "Extraction failed"
+            "SQL EXTRACTOR V2 FAILED."
         )
-
-        if extraction_id and repo_conn:
-
-            try:
-                update_extraction_log(
-                    repo_conn.cursor(),
-                    extraction_id,
-                    "Failed",
-                    error_message=str(exc),
-                )
-            except Exception:
-                logging.exception(
-                    "Failed to update extraction log"
-                )
 
         return 1
 
     finally:
 
-        if source_conn:
+        if source_conn is not None:
 
-            source_conn.close()
+            try:
+                source_conn.close()
 
-            logging.info(
-                "Closed source database connection"
-            )
+                logging.info(
+                    "Closed source SQL connection."
+                )
 
-        if repo_conn:
+            except Exception:
+                logging.exception(
+                    "Error closing source connection."
+                )
 
-            repo_conn.close()
+        if repository_conn is not None:
 
-            logging.info(
-                "Closed Fabric Warehouse connection"
-            )
+            try:
+                repository_conn.close()
+
+                logging.info(
+                    "Closed Fabric Warehouse connection."
+                )
+
+            except Exception:
+                logging.exception(
+                    "Error closing repository connection."
+                )
+
+
+# ===========================================================================
+# ENTRY POINT
+# ===========================================================================
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
-
+    raise SystemExit(
+        main()
+    )

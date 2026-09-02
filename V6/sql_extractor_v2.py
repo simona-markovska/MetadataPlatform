@@ -32,16 +32,16 @@ from config.config import (
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
 # ---------------------------------------------------------------------------
-# V6 TEST REPOSITORY
+# METADATA REPOSITORY
 # ---------------------------------------------------------------------------
 
+# Fabric Warehouse SQL endpoint
 FABRIC_SQL_SERVER = (
-    "j7mjaqg22d2ujb27llpciiyism-"
-    "7jnw46tiqcde5cpv233ctk345u."
-    "datawarehouse.fabric.microsoft.com"
+    "j7mjaqg22d2ujb27llpciiyism-7jnw46tiqcde5cpv233ctk345u.datawarehouse.fabric.microsoft.com"
 )
 
-FABRIC_SQL_DATABASE = "MetadataRepository_V6_Test"
+# Fabric Warehouse database name
+FABRIC_SQL_DATABASE = "MetadataRepository"
 
 
 # ---------------------------------------------------------------------------

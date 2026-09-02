@@ -1,63 +1,192 @@
 import base64
+import json
 import logging
 import re
 import sys
+
 from pathlib import Path
+from collections import defaultdict
 
 import pyodbc
 
 
-# ===========================================================================
+# ============================================================================
 # PROJECT PATH
-# ===========================================================================
+# ============================================================================
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT_DIR))
+
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 
 from config.config import DEFAULT_DRIVER
 from src.fabric.client import FabricClient
 
 
-# ===========================================================================
+# ============================================================================
 # CONFIGURATION
-# ===========================================================================
+# ============================================================================
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
-
-# ---------------------------------------------------------------------------
-# Fabric workspace
-# ---------------------------------------------------------------------------
-
-WORKSPACE_ID = "7a6e5bfa-8068-4e86-89f5-d6f629ab7ced"
-
-WORKSPACE_NAME = "Metadata Intelligence Platform"
-
-
-# ---------------------------------------------------------------------------
-# Source SQL database
-# ---------------------------------------------------------------------------
-
-SOURCE_DATABASE = "AdventureWorks2022"
-SOURCE_SERVER = "AXM345"
-
-
-# ---------------------------------------------------------------------------
-# Fabric Warehouse
-# ---------------------------------------------------------------------------
-
-FABRIC_SQL_SERVER = (
-    "j7mjaqg22d2ujb27llpciiyism-7jnw46tiqcde5cpv233ctk345u"
-    ".datawarehouse.fabric.microsoft.com"
+WORKSPACE_CONFIG_FILE = (
+    ROOT_DIR / "config" / "workspaces.json"
 )
 
+
+# ============================================================================
+# METADATA REPOSITORY
+# ============================================================================
+
+# Fabric Warehouse SQL endpoint
+FABRIC_SQL_SERVER = (
+    "j7mjaqg22d2ujb27llpciiyism-7jnw46tiqcde5cpv233ctk345u.datawarehouse.fabric.microsoft.com"
+)
+
+# Fabric Warehouse database name
 FABRIC_SQL_DATABASE = "MetadataRepository"
 
 
-# ===========================================================================
-# FABRIC WAREHOUSE CONNECTION
-# ===========================================================================
+# ============================================================================
+# WORKSPACE CONFIGURATION
+# ============================================================================
 
+def load_enabled_workspaces():
+    """
+    Load enabled Fabric workspaces from config/workspaces.json.
+
+    Expected format:
+
+    {
+        "workspaces": [
+            {
+                "workspace_id": "...",
+                "workspace_name": "...",
+                "enabled": true
+            }
+        ]
+    }
+
+    Only workspaces with enabled=true are returned.
+    """
+
+    if not WORKSPACE_CONFIG_FILE.exists():
+
+        raise FileNotFoundError(
+            "Workspace configuration file not found: "
+            f"{WORKSPACE_CONFIG_FILE}"
+        )
+
+    try:
+
+        with open(
+            WORKSPACE_CONFIG_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file:
+
+            config = json.load(file)
+
+    except json.JSONDecodeError as exc:
+
+        raise RuntimeError(
+            "Invalid JSON in workspace configuration file: "
+            f"{WORKSPACE_CONFIG_FILE}"
+        ) from exc
+
+    workspaces = config.get(
+        "workspaces",
+        [],
+    )
+
+    if not isinstance(
+        workspaces,
+        list,
+    ):
+
+        raise RuntimeError(
+            "'workspaces' must be a list in "
+            f"{WORKSPACE_CONFIG_FILE}"
+        )
+
+    enabled_workspaces = []
+
+    for workspace in workspaces:
+
+        if not isinstance(
+            workspace,
+            dict,
+        ):
+
+            logging.warning(
+                "Ignoring invalid workspace entry: %s",
+                workspace,
+            )
+
+            continue
+
+        workspace_id = workspace.get(
+            "workspace_id"
+        )
+
+        workspace_name = workspace.get(
+            "workspace_name"
+        )
+
+        enabled = workspace.get(
+            "enabled",
+            True,
+        )
+
+        if not workspace_id:
+
+            logging.warning(
+                "Ignoring workspace without workspace_id: %s",
+                workspace,
+            )
+
+            continue
+
+        if not workspace_name:
+
+            logging.warning(
+                "Ignoring workspace without workspace_name: %s",
+                workspace_id,
+            )
+
+            continue
+
+        if not enabled:
+
+            logging.info(
+                "Workspace disabled: %s | %s",
+                workspace_name,
+                workspace_id,
+            )
+
+            continue
+
+        enabled_workspaces.append(
+            {
+                "workspace_id": workspace_id,
+                "workspace_name": workspace_name,
+            }
+        )
+
+    if not enabled_workspaces:
+
+        raise RuntimeError(
+            "No enabled workspaces found in "
+            f"{WORKSPACE_CONFIG_FILE}"
+        )
+
+    return enabled_workspaces
+
+
+# ============================================================================
+# READ / WRITE FABRIC WAREHOUSE CONNECTION
+# ============================================================================
 
 def get_fabric_connection_string(
     driver: str,
@@ -72,7 +201,31 @@ def get_fabric_connection_string(
         "Authentication=ActiveDirectoryInteractive;"
         "Encrypt=yes;"
         "TrustServerCertificate=no;"
+        # Forces ODBC Driver 18 to bind long text parameters as
+        # varchar(max) instead of falling back to the legacy
+        # SQL_LONGVARCHAR -> text/ntext path, which is incompatible
+        # with UTF-8 collations (Latin1_General_100_BIN2_UTF8).
+        "LongAsMax=yes;"
     )
+
+
+def _decode_utf8_column(raw_bytes):
+    """
+    Output converter for long UTF-8-collation varchar(max) columns
+    on READ. Receives the FULLY REASSEMBLED raw bytes for the column
+    value (pyodbc has already looped over all internal SQLGetData
+    chunks and concatenated them before calling this function), so
+    decoding here -- once -- avoids a pyodbc bug where
+    connection.setdecoding(SQL_CHAR, "utf-8") can decode individual
+    internal chunks separately and fail with "unexpected end of
+    data" whenever a multi-byte UTF-8 character (e.g. Δ = 0xCE 0x94)
+    falls across a chunk boundary.
+    """
+
+    if raw_bytes is None:
+        return None
+
+    return raw_bytes.decode("utf-8")
 
 
 def connect_to_fabric_warehouse(
@@ -81,36 +234,84 @@ def connect_to_fabric_warehouse(
     database: str,
 ) -> pyodbc.Connection:
 
-    connection_string = get_fabric_connection_string(
-        driver,
-        server,
-        database,
+    connection_string = (
+        get_fabric_connection_string(
+            driver,
+            server,
+            database,
+        )
     )
 
     logging.info(
         "Opening Microsoft Entra interactive authentication..."
     )
 
-    return pyodbc.connect(connection_string)
+    connection = pyodbc.connect(
+        connection_string
+    )
+
+    # READS: use an output converter instead of setdecoding(). This
+    # avoids the pyodbc chunked-SQLGetData decode bug that produces
+    # "UnicodeDecodeError ... unexpected end of data" on long
+    # varchar(max) columns with non-ASCII content.
+    connection.add_output_converter(
+        pyodbc.SQL_CHAR,
+        _decode_utf8_column,
+    )
+
+    connection.add_output_converter(
+        pyodbc.SQL_VARCHAR,
+        _decode_utf8_column,
+    )
+
+    # WRITES: deliberately do NOT call connection.setencoding(...).
+    # Forcing SQL_C_CHAR/UTF-8 binding on outgoing parameters causes
+    # the ODBC driver to reinterpret those bytes through the
+    # client's ANSI codepage (e.g. cp1252) before converting them
+    # into the UTF-8-collation column -- double-encoding characters
+    # like Δ (0xCE 0x94) into "Î\x94". Leaving encoding unset lets
+    # pyodbc use its default SQL_C_WCHAR / UTF-16LE binding for
+    # outgoing strings, which the driver converts unambiguously into
+    # the UTF-8-collation varchar(max) columns. Combined with
+    # LongAsMax=yes in the connection string, this writes long,
+    # non-ASCII DAX/M expressions correctly.
+
+    return connection
 
 
-# ===========================================================================
-# SEMANTIC MODEL EXTRACTOR
-# ===========================================================================
-
+# ============================================================================
+# TMDL EXTRACTOR
+# ============================================================================
 
 class SemanticModelExtractor:
     """
-    Extract metadata from a Microsoft Fabric semantic model definition.
+    V6.3 Semantic Model Metadata Extractor.
 
-    Extracts:
+    Responsibilities:
 
-        - Tables
-        - Table classifications
-        - Columns
-        - Measures
-        - DAX expressions
-        - Relationships
+        - Extract semantic models
+        - Extract semantic tables
+        - Classify tables
+        - Extract columns
+        - Detect calculated columns
+        - Extract measures
+        - Extract DAX
+        - Extract Power Query / M
+        - Extract source mappings
+        - Extract source columns
+        - Detect Power Query renames
+        - Resolve rename chains
+        - Extract calculated tables
+        - Extract semantic dependencies
+        - Extract measure dependencies
+        - Extract table dependencies
+        - Extract relationships
+        - Detect hidden objects
+
+    This class is extraction-only.
+
+    Repository persistence is handled separately by
+    MetadataRepositoryWriter.
     """
 
     def __init__(
@@ -124,7 +325,9 @@ class SemanticModelExtractor:
         self.definition = definition
 
         self.workspace_id = workspace_id
+
         self.semantic_model_id = semantic_model_id
+
         self.semantic_model_name = semantic_model_name
 
         self.parts = (
@@ -133,11 +336,12 @@ class SemanticModelExtractor:
             .get("parts", [])
         )
 
-    # =======================================================================
+    # ========================================================================
     # PAYLOAD
-    # =======================================================================
+    # ========================================================================
 
-    def _decode_part(self, part):
+    @staticmethod
+    def _decode_part(part):
 
         payload = part.get("payload")
 
@@ -151,7 +355,9 @@ class SemanticModelExtractor:
 
         try:
 
-            decoded = base64.b64decode(payload)
+            decoded = base64.b64decode(
+                payload
+            )
 
             return decoded.decode(
                 "utf-8",
@@ -161,14 +367,15 @@ class SemanticModelExtractor:
         except Exception:
 
             logging.exception(
-                "Failed to decode definition part"
+                "Failed to decode TMDL part: %s",
+                part.get("path"),
             )
 
             return ""
 
-    # =======================================================================
+    # ========================================================================
     # TABLES
-    # =======================================================================
+    # ========================================================================
 
     def extract_tables(self):
 
@@ -191,19 +398,31 @@ class SemanticModelExtractor:
             ):
                 continue
 
-            content = self._decode_part(part)
+            content = self._decode_part(
+                part
+            )
 
-            table_name = self._extract_table_name(
-                content
+            table_name = (
+                self._extract_table_name(
+                    content
+                )
             )
 
             if not table_name:
                 continue
 
-            table_type = self._classify_table(
-                table_name,
-                content,
-                path,
+            table_type = (
+                self._classify_table(
+                    table_name,
+                    content,
+                )
+            )
+
+            is_hidden = (
+                self._extract_property(
+                    content,
+                    "isHidden",
+                )
             )
 
             tables.append(
@@ -211,183 +430,109 @@ class SemanticModelExtractor:
                     "table_name": table_name,
                     "table_type": table_type,
                     "definition_path": path,
+                    "is_hidden": is_hidden,
+                    "content": content,
                 }
             )
 
         return tables
 
-    # =======================================================================
+    # ========================================================================
     # TABLE CLASSIFICATION
-    # =======================================================================
+    # ========================================================================
 
     @staticmethod
     def _classify_table(
         table_name,
         content,
-        path,
     ):
 
         lower_name = table_name.lower()
-        lower_content = content.lower()
 
-        # -------------------------------------------------------------------
-        # Date template
-        # -------------------------------------------------------------------
+        lower_content = content.lower()
 
         if table_name.startswith(
             "DateTableTemplate_"
         ):
-
             return "Date Template"
-
-        # -------------------------------------------------------------------
-        # Auto date
-        # -------------------------------------------------------------------
 
         if table_name.startswith(
             "LocalDateTable_"
         ):
-
             return "Auto Date"
-
-        # -------------------------------------------------------------------
-        # Explicit measure table
-        # -------------------------------------------------------------------
 
         if lower_name in {
             "dax_measures",
             "measures",
             "measure table",
         }:
-
             return "Measure Table"
 
-        # -------------------------------------------------------------------
-        # Calculated table
-        # -------------------------------------------------------------------
-
-        calculated_partition = re.search(
-            r"(?im)^\s*partition\s+.+?\s*=\s*calculated\s*$",
+        if re.search(
+            r"(?im)^\s*partition\s+.+?=\s*calculated\b",
             content,
-        )
-
-        if calculated_partition:
-
+        ):
             return "Calculated"
-
-        # -------------------------------------------------------------------
-        # Additional calculated-table detection
-        # -------------------------------------------------------------------
-
-        calculated_expression = re.search(
-            r"(?ims)"
-            r"^\s*partition\s+.+?\s*=\s*calculated\s*"
-            r".*?"
-            r"(?:^|\n)\s*expression\s*=",
-            content,
-        )
-
-        if calculated_expression:
-
-            return "Calculated"
-
-        # -------------------------------------------------------------------
-        # Additional calculated indicators
-        # -------------------------------------------------------------------
-
-        calculated_indicators = [
-            "tablekind = calculated",
-            "calculatedtable",
-            "calculationgroup",
-        ]
-
-        for indicator in calculated_indicators:
-
-            if indicator in lower_content:
-
-                return "Calculated"
-
-        # -------------------------------------------------------------------
-        # Measure table based on TMDL metadata
-        # -------------------------------------------------------------------
-
-        has_measure = bool(
-            re.search(
-                r"(?m)^\s*measure\s+",
-                content,
-            )
-        )
-
-        has_display_folder = (
-            "displayfolder:" in lower_content
-        )
-
-        has_measure_group = (
-            "measuregroup" in lower_content
-        )
 
         if (
-            has_measure
-            and (
-                has_display_folder
-                or has_measure_group
-            )
+            "tablekind = calculated"
+            in lower_content
         ):
+            return "Calculated"
 
-            return "Measure Table"
-
-        # -------------------------------------------------------------------
-        # Source table
-        # -------------------------------------------------------------------
+        if (
+            "calculatedtable"
+            in lower_content
+        ):
+            return "Calculated"
 
         return "Source"
 
-    # =======================================================================
+    # ========================================================================
     # COLUMNS
-    # =======================================================================
+    # ========================================================================
 
-    def extract_columns(self):
+    def extract_columns(
+        self,
+        tables,
+    ):
 
         columns = []
 
-        for part in self.parts:
+        for table in tables:
 
-            path = part.get(
-                "path",
-                "",
-            )
+            table_name = table[
+                "table_name"
+            ]
 
-            if not path.startswith(
-                "definition/tables/"
-            ):
-                continue
+            content = table[
+                "content"
+            ]
 
-            if not path.endswith(
-                ".tmdl"
-            ):
-                continue
+            path = table[
+                "definition_path"
+            ]
 
-            content = self._decode_part(part)
+            lines = content.splitlines()
 
-            table_name = self._extract_table_name(
-                content
-            )
+            index = 0
 
-            if not table_name:
-                continue
+            while index < len(lines):
 
-            for line in content.splitlines():
-
-                stripped = line.strip()
+                stripped = lines[
+                    index
+                ].strip()
 
                 if not stripped.startswith(
                     "column "
                 ):
+                    index += 1
                     continue
 
                 definition = (
-                    stripped[len("column "):]
-                    .strip()
+                    stripped[
+                        len("column "):
+                    ].strip()
                 )
 
                 column_name = (
@@ -397,62 +542,114 @@ class SemanticModelExtractor:
                 )
 
                 if not column_name:
+
+                    index += 1
+
                     continue
+
+                remainder = (
+                    self._remove_object_name(
+                        definition
+                    )
+                )
+
+                calculated = False
+
+                expression = None
+
+                if remainder.startswith(
+                    "="
+                ):
+
+                    calculated = True
+
+                    expression = (
+                        remainder[
+                            1:
+                        ].strip()
+                    )
+
+                    expression = (
+                        self._collect_multiline_expression(
+                            lines,
+                            index,
+                            expression,
+                        )
+                    )
+
+                object_block = (
+                    self._get_object_block(
+                        lines,
+                        index,
+                    )
+                )
+
+                source_column = (
+                    self._extract_property(
+                        object_block,
+                        "sourceColumn",
+                    )
+                )
+
+                data_type = (
+                    self._extract_property(
+                        object_block,
+                        "dataType",
+                    )
+                )
+
+                is_hidden = (
+                    self._extract_property(
+                        object_block,
+                        "isHidden",
+                    )
+                )
 
                 columns.append(
                     {
                         "table_name": table_name,
                         "column_name": column_name,
+                        "column_type": (
+                            "Calculated"
+                            if calculated
+                            else "Source"
+                        ),
+                        "expression": expression,
+                        "source_column": source_column,
+                        "data_type": data_type,
+                        "is_hidden": is_hidden,
                         "definition_path": path,
                     }
                 )
 
+                index += 1
+
         return columns
 
-    # =======================================================================
+    # ========================================================================
     # MEASURES
-    # =======================================================================
+    # ========================================================================
 
-    def extract_measures(self):
+    def extract_measures(
+        self,
+        tables,
+    ):
 
         measures = []
 
-        property_pattern = re.compile(
-            r"^\s*("
-            r"formatString"
-            r"|displayFolder"
-            r"|lineageTag"
-            r"|description"
-            r"|isHidden"
-            r"|dataCategory"
-            r"|formatStringDefinition"
-            r"|extendedProperties"
-            r"|annotation"
-            r"|changedProperty"
-            r"|modifiedTime"
-            r"|ref"
-            r"|expression"
-            r"|partition"
-            r"|column"
-            r"|measure"
-            r"|table"
-            r")\s*[:=]",
-            re.IGNORECASE,
-        )
+        for table in tables:
 
-        for part in self.parts:
+            table_name = table[
+                "table_name"
+            ]
 
-            path = part.get(
-                "path",
-                "",
-            )
+            path = table[
+                "definition_path"
+            ]
 
-            if not path.endswith(
-                ".tmdl"
-            ):
-                continue
-
-            content = self._decode_part(part)
+            content = table[
+                "content"
+            ]
 
             lines = content.splitlines()
 
@@ -460,177 +657,519 @@ class SemanticModelExtractor:
 
             while index < len(lines):
 
-                stripped = lines[index].strip()
+                stripped = lines[
+                    index
+                ].strip()
 
                 if not stripped.startswith(
                     "measure "
                 ):
-
                     index += 1
                     continue
 
-                measure_definition = (
-                    stripped[len("measure "):]
-                    .strip()
+                definition = (
+                    stripped[
+                        len("measure "):
+                    ].strip()
                 )
-
-                # -----------------------------------------------------------
-                # Quoted measure
-                # -----------------------------------------------------------
 
                 match = re.match(
                     r"'([^']+)'\s*=\s*(.*)",
-                    measure_definition,
+                    definition,
                 )
 
                 if match:
 
-                    measure_name = match.group(1)
-                    expression = match.group(2)
+                    measure_name = (
+                        match.group(1)
+                    )
+
+                    expression = (
+                        match.group(2)
+                    )
 
                 else:
 
-                    # -------------------------------------------------------
-                    # Unquoted measure
-                    # -------------------------------------------------------
-
                     match = re.match(
                         r"([^\s=]+)\s*=\s*(.*)",
-                        measure_definition,
+                        definition,
                     )
 
                     if not match:
 
                         index += 1
+
                         continue
 
-                    measure_name = match.group(1)
-                    expression = match.group(2)
-
-                # -----------------------------------------------------------
-                # Collect DAX expression
-                # -----------------------------------------------------------
-
-                expression_lines = []
-
-                if expression:
-
-                    expression_lines.append(
-                        expression.strip()
+                    measure_name = (
+                        match.group(1)
                     )
 
-                next_index = index + 1
-
-                while next_index < len(lines):
-
-                    next_line = lines[next_index]
-
-                    stripped_next = next_line.strip()
-
-                    # -------------------------------------------------------
-                    # Empty line inside DAX
-                    # -------------------------------------------------------
-
-                    if stripped_next == "":
-
-                        if expression_lines:
-
-                            expression_lines.append("")
-
-                        next_index += 1
-                        continue
-
-                    # -------------------------------------------------------
-                    # Stop when another measure starts
-                    # -------------------------------------------------------
-
-                    if stripped_next.startswith(
-                        "measure "
-                    ):
-
-                        break
-
-                    # -------------------------------------------------------
-                    # Stop when another object starts
-                    # -------------------------------------------------------
-
-                    if stripped_next.startswith(
-                        "column "
-                    ):
-
-                        break
-
-                    if stripped_next.startswith(
-                        "partition "
-                    ):
-
-                        break
-
-                    if stripped_next.startswith(
-                        "table "
-                    ):
-
-                        break
-
-                    # -------------------------------------------------------
-                    # TMDL properties are not DAX
-                    # -------------------------------------------------------
-
-                    if property_pattern.match(
-                        stripped_next
-                    ):
-
-                        break
-
-                    # -------------------------------------------------------
-                    # DAX continuation must be indented
-                    # -------------------------------------------------------
-
-                    if (
-                        not next_line.startswith(" ")
-                        and not next_line.startswith("\t")
-                    ):
-
-                        break
-
-                    expression_lines.append(
-                        stripped_next
+                    expression = (
+                        match.group(2)
                     )
 
-                    next_index += 1
+                expression = (
+                    self._collect_multiline_expression(
+                        lines,
+                        index,
+                        expression,
+                    )
+                )
 
-                # -----------------------------------------------------------
-                # Clean expression
-                # -----------------------------------------------------------
+                block = (
+                    self._get_object_block(
+                        lines,
+                        index,
+                    )
+                )
 
-                while (
-                    expression_lines
-                    and expression_lines[-1] == ""
-                ):
-
-                    expression_lines.pop()
-
-                full_expression = "\n".join(
-                    expression_lines
-                ).strip()
+                is_hidden = (
+                    self._extract_property(
+                        block,
+                        "isHidden",
+                    )
+                )
 
                 measures.append(
                     {
+                        "table_name": table_name,
                         "measure_name": measure_name,
-                        "expression": full_expression,
+                        "expression": expression,
                         "definition_path": path,
+                        "is_hidden": is_hidden,
                     }
                 )
 
-                index = next_index
+                index += 1
 
         return measures
 
-    # =======================================================================
-    # RELATIONSHIPS
-    # =======================================================================
+    # ========================================================================
+    # SOURCE MAPPINGS
+    # ========================================================================
 
-    def extract_relationships(self):
+    def extract_source_mappings(
+        self,
+        tables,
+    ):
+
+        mappings = []
+
+        for table in tables:
+
+            if table[
+                "table_type"
+            ] != "Source":
+
+                continue
+
+            table_name = table[
+                "table_name"
+            ]
+
+            content = table[
+                "content"
+            ]
+
+            m_expression = (
+                self._extract_m_expression(
+                    content
+                )
+            )
+
+            source_info = (
+                self._extract_source_information(
+                    m_expression
+                )
+            )
+
+            rename_operations = (
+                self._extract_rename_operations(
+                    m_expression
+                )
+            )
+
+            rename_map = (
+                self._build_final_rename_map(
+                    rename_operations
+                )
+            )
+
+            mappings.append(
+                {
+                    "semantic_table": table_name,
+                    "source_type": source_info[
+                        "source_type"
+                    ],
+                    "server": source_info[
+                        "server"
+                    ],
+                    "database": source_info[
+                        "database"
+                    ],
+                    "workspace": source_info[
+                        "workspace"
+                    ],
+                    "warehouse": source_info[
+                        "warehouse"
+                    ],
+                    "schema": source_info[
+                        "schema"
+                    ],
+                    "source_table": source_info[
+                        "source_table"
+                    ],
+                    "m_expression": m_expression,
+                    "rename_operations": rename_operations,
+                    "rename_map": rename_map,
+                }
+            )
+
+        return mappings
+
+    # ========================================================================
+    # SOURCE INFORMATION
+    # ========================================================================
+
+    @staticmethod
+    def _extract_source_information(
+        m_expression,
+    ):
+
+        result = {
+            "source_type": "UNKNOWN",
+            "server": None,
+            "database": None,
+            "workspace": None,
+            "warehouse": None,
+            "schema": None,
+            "source_table": None,
+        }
+
+        if not m_expression:
+            return result
+
+        # --------------------------------------------------------------------
+        # SQL DATABASE
+        # --------------------------------------------------------------------
+
+        sql_match = re.search(
+            r'Sql\.Database\s*'
+            r'\(\s*'
+            r'"([^"]+)"'
+            r'\s*,\s*'
+            r'"([^"]+)"'
+            r'\s*\)',
+            m_expression,
+            re.IGNORECASE,
+        )
+
+        if sql_match:
+
+            result[
+                "source_type"
+            ] = "SQL"
+
+            result[
+                "server"
+            ] = sql_match.group(1)
+
+            result[
+                "database"
+            ] = sql_match.group(2)
+
+        # --------------------------------------------------------------------
+        # FABRIC WAREHOUSE
+        # --------------------------------------------------------------------
+
+        warehouse_match = re.search(
+            r'Fabric\.Warehouse\s*'
+            r'\(\s*'
+            r'"([^"]+)"'
+            r'\s*,\s*'
+            r'"([^"]+)"',
+            m_expression,
+            re.IGNORECASE,
+        )
+
+        if warehouse_match:
+
+            result[
+                "source_type"
+            ] = "FABRIC_WAREHOUSE"
+
+            result[
+                "workspace"
+            ] = warehouse_match.group(1)
+
+            result[
+                "warehouse"
+            ] = warehouse_match.group(2)
+
+        # --------------------------------------------------------------------
+        # GENERIC FABRIC WAREHOUSE REFERENCE
+        # --------------------------------------------------------------------
+
+        if (
+            result[
+                "source_type"
+            ]
+            == "UNKNOWN"
+        ):
+
+            if (
+                "warehouse"
+                in m_expression.lower()
+            ):
+
+                result[
+                    "source_type"
+                ] = "FABRIC_WAREHOUSE"
+
+        # --------------------------------------------------------------------
+        # NAVIGATION
+        # --------------------------------------------------------------------
+
+        navigation_match = re.search(
+            r'\[\s*Schema\s*=\s*"([^"]+)"'
+            r'\s*,\s*Item\s*=\s*"([^"]+)"',
+            m_expression,
+            re.IGNORECASE,
+        )
+
+        if navigation_match:
+
+            result[
+                "schema"
+            ] = navigation_match.group(1)
+
+            result[
+                "source_table"
+            ] = navigation_match.group(2)
+
+        # --------------------------------------------------------------------
+        # ALTERNATIVE ITEM-ONLY NAVIGATION
+        # --------------------------------------------------------------------
+
+        if not result[
+            "source_table"
+        ]:
+
+            item_match = re.search(
+                r'\[\s*Item\s*=\s*"([^"]+)"',
+                m_expression,
+                re.IGNORECASE,
+            )
+
+            if item_match:
+
+                result[
+                    "source_table"
+                ] = item_match.group(1)
+
+        return result
+
+    # ========================================================================
+    # M EXPRESSION
+    # ========================================================================
+
+    @staticmethod
+    def _extract_m_expression(
+        content,
+    ):
+
+        match = re.search(
+            r"(?ims)"
+            r"^\s*partition\s+.+?=\s*m\s*"
+            r"(.*?)"
+            r"(?=^\s*(?:annotation|partition)\b|\Z)",
+            content,
+        )
+
+        if match:
+
+            return match.group(1).strip()
+
+        match = re.search(
+            r"(?ims)"
+            r"\blet\s+"
+            r"(.*?)"
+            r"(?=^\s*annotation\b|\Z)",
+            content,
+        )
+
+        if match:
+
+            return (
+                "let\n"
+                + match.group(1).strip()
+            )
+
+        return ""
+
+    # ========================================================================
+    # RENAME OPERATIONS
+    # ========================================================================
+
+    @staticmethod
+    def _extract_rename_operations(
+        m_expression,
+    ):
+
+        operations = []
+
+        if not m_expression:
+            return operations
+
+        pattern = re.compile(
+            r"Table\.RenameColumns"
+            r"\s*\("
+            r".*?"
+            r"\{"
+            r"(.*?)"
+            r"\}"
+            r"\s*\)",
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        for match in pattern.finditer(
+            m_expression
+        ):
+
+            pairs_text = match.group(1)
+
+            pairs = re.findall(
+                r'\{\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\}',
+                pairs_text,
+            )
+
+            for original, semantic in pairs:
+
+                operations.append(
+                    {
+                        "original_column": original,
+                        "new_column": semantic,
+                        "transformation": (
+                            "Table.RenameColumns"
+                        ),
+                    }
+                )
+
+        return operations
+
+    # ========================================================================
+    # FINAL RENAME MAP
+    # ========================================================================
+
+    @staticmethod
+    def _build_final_rename_map(
+        operations,
+    ):
+
+        if not operations:
+            return {}
+
+        final_to_original = {}
+
+        for operation in operations:
+
+            original = operation[
+                "original_column"
+            ]
+
+            new_name = operation[
+                "new_column"
+            ]
+
+            physical = (
+                final_to_original.get(
+                    original,
+                    original,
+                )
+            )
+
+            final_to_original[
+                new_name
+            ] = physical
+
+        return final_to_original
+
+    # ========================================================================
+    # CALCULATED TABLES
+    # ========================================================================
+
+    def extract_calculated_tables(
+        self,
+        tables,
+    ):
+
+        results = []
+
+        for table in tables:
+
+            if table[
+                "table_type"
+            ] != "Calculated":
+
+                continue
+
+            expression = (
+                self._extract_calculated_expression(
+                    table[
+                        "content"
+                    ]
+                )
+            )
+
+            results.append(
+                {
+                    "table_name": table[
+                        "table_name"
+                    ],
+                    "expression": expression,
+                    "definition_path": table[
+                        "definition_path"
+                    ],
+                }
+            )
+
+        return results
+
+    @staticmethod
+    def _extract_calculated_expression(
+        content,
+    ):
+
+        match = re.search(
+            r"(?ims)"
+            r"^\s*partition\s+.+?=\s*calculated\s*"
+            r"(.*?)"
+            r"(?=^\s*(?:annotation|partition)\b|\Z)",
+            content,
+        )
+
+        if not match:
+            return ""
+
+        block = match.group(1).strip()
+
+        block = re.sub(
+            r"^\s*expression\s*=\s*",
+            "",
+            block,
+            flags=re.IGNORECASE,
+        )
+
+        return block.strip()
+
+    # ========================================================================
+    # RELATIONSHIPS
+    # ========================================================================
+
+    def extract_relationships(
+        self,
+    ):
 
         relationships = []
 
@@ -638,15 +1177,16 @@ class SemanticModelExtractor:
 
         for part in self.parts:
 
-            if part.get("path") == (
-                "definition/relationships.tmdl"
+            if (
+                part.get("path")
+                == "definition/relationships.tmdl"
             ):
 
                 relationship_part = part
+
                 break
 
         if not relationship_part:
-
             return relationships
 
         content = self._decode_part(
@@ -655,24 +1195,19 @@ class SemanticModelExtractor:
 
         lines = content.splitlines()
 
-        current_relationship = None
+        current = None
 
         for line in lines:
 
             stripped = line.strip()
 
-            # ----------------------------------------------------------------
-            # Relationship
-            # ----------------------------------------------------------------
-
             if stripped.startswith(
                 "relationship "
             ):
 
-                if current_relationship:
-
+                if current:
                     relationships.append(
-                        current_relationship
+                        current
                     )
 
                 relationship_id = (
@@ -681,20 +1216,22 @@ class SemanticModelExtractor:
                     ].strip()
                 )
 
-                current_relationship = {
+                current = {
                     "relationship_id":
                         relationship_id,
 
-                    "from_table": None,
-                    "from_column": None,
+                    "from_table":
+                        None,
 
-                    "to_table": None,
-                    "to_column": None,
+                    "from_column":
+                        None,
+
+                    "to_table":
+                        None,
+
+                    "to_column":
+                        None,
                 }
-
-            # ----------------------------------------------------------------
-            # From
-            # ----------------------------------------------------------------
 
             elif stripped.startswith(
                 "fromColumn:"
@@ -710,19 +1247,15 @@ class SemanticModelExtractor:
                     )
                 )
 
-                if current_relationship:
+                if current:
 
-                    current_relationship[
+                    current[
                         "from_table"
                     ] = table
 
-                    current_relationship[
+                    current[
                         "from_column"
                     ] = column
-
-            # ----------------------------------------------------------------
-            # To
-            # ----------------------------------------------------------------
 
             elif stripped.startswith(
                 "toColumn:"
@@ -738,30 +1271,31 @@ class SemanticModelExtractor:
                     )
                 )
 
-                if current_relationship:
+                if current:
 
-                    current_relationship[
+                    current[
                         "to_table"
                     ] = table
 
-                    current_relationship[
+                    current[
                         "to_column"
                     ] = column
 
-        if current_relationship:
-
+        if current:
             relationships.append(
-                current_relationship
+                current
             )
 
         return relationships
 
-    # =======================================================================
+    # ========================================================================
     # HELPERS
-    # =======================================================================
+    # ========================================================================
 
     @staticmethod
-    def _extract_table_name(content):
+    def _extract_table_name(
+        content,
+    ):
 
         for line in content.splitlines():
 
@@ -782,7 +1316,11 @@ class SemanticModelExtractor:
         return None
 
     @staticmethod
-    def _extract_object_name(value):
+    def _extract_object_name(
+        value,
+    ):
+
+        value = value.strip()
 
         if value.startswith("'"):
 
@@ -792,19 +1330,69 @@ class SemanticModelExtractor:
             )
 
             if match:
-
                 return match.group(1)
 
         parts = value.split()
 
-        return (
-            parts[0]
-            if parts
-            else None
-        )
+        if parts:
+
+            return parts[
+                0
+            ].strip("'")
+
+        return None
 
     @staticmethod
-    def _split_table_column(value):
+    def _remove_object_name(
+        value,
+    ):
+
+        value = value.strip()
+
+        if value.startswith("'"):
+
+            match = re.match(
+                r"'[^']+'\s*(.*)$",
+                value,
+            )
+
+            if match:
+
+                return match.group(
+                    1
+                ).strip()
+
+        match = re.match(
+            r"[^\s]+\s*(.*)$",
+            value,
+        )
+
+        if match:
+
+            return match.group(
+                1
+            ).strip()
+
+        return ""
+
+    @staticmethod
+    def _split_table_column(
+        value,
+    ):
+
+        value = value.strip()
+
+        match = re.match(
+            r"'([^']+)'\.\[([^\]]+)\]",
+            value,
+        )
+
+        if match:
+
+            return (
+                match.group(1),
+                match.group(2),
+            )
 
         match = re.match(
             r"'([^']+)'\.([^\s]+)",
@@ -820,753 +1408,1341 @@ class SemanticModelExtractor:
 
         if "." in value:
 
-            table, column = value.rsplit(
-                ".",
-                1,
+            table, column = (
+                value.rsplit(
+                    ".",
+                    1,
+                )
             )
 
             return (
                 table.strip("'"),
-                column,
+                column.strip("[]"),
             )
 
         return (
             None,
-            value,
+            value.strip("[]"),
         )
 
+    @staticmethod
+    def _extract_property(
+        content,
+        property_name,
+    ):
 
-# ===========================================================================
-# SEMANTIC MODEL
-# ===========================================================================
+        if not content:
+            return None
 
-
-def get_semantic_model_id(
-    cursor,
-    model_name,
-    fabric_model_id,
-):
-
-    cursor.execute(
-        """
-        SELECT SemanticModelID
-        FROM dbo.MetadataSemanticModel
-        WHERE FabricModelID = ?
-        """,
-        fabric_model_id,
-    )
-
-    result = cursor.fetchone()
-
-    if result:
-
-        return int(result[0])
-
-    cursor.execute(
-        """
-        INSERT INTO dbo.MetadataSemanticModel
-        (
-            ModelName,
-            WorkspaceID,
-            WorkspaceName,
-            FabricModelID,
-            SourceType
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        model_name,
-        WORKSPACE_ID,
-        None,
-        fabric_model_id,
-        "Microsoft Fabric Semantic Model",
-    )
-
-    cursor.connection.commit()
-
-    cursor.execute(
-        """
-        SELECT MAX(SemanticModelID)
-        FROM dbo.MetadataSemanticModel
-        WHERE FabricModelID = ?
-        """,
-        fabric_model_id,
-    )
-
-    result = cursor.fetchone()
-
-    if not result or result[0] is None:
-
-        raise RuntimeError(
-            "Could not retrieve SemanticModelID."
+        pattern = re.compile(
+            rf"(?im)^\s*{re.escape(property_name)}\s*[:=]\s*(.+?)\s*$"
         )
 
-    return int(result[0])
+        match = pattern.search(
+            content
+        )
+
+        if not match:
+            return None
+
+        value = match.group(
+            1
+        ).strip()
+
+        value = value.strip(
+            '"'
+        )
+
+        return value
+
+    @staticmethod
+    def _get_object_block(
+        lines,
+        start_index,
+    ):
+
+        block = []
+
+        index = start_index
+
+        while index < len(lines):
+
+            line = lines[
+                index
+            ]
+
+            stripped = line.strip()
+
+            if (
+                index > start_index
+                and stripped
+                and not line.startswith(
+                    " "
+                )
+                and not line.startswith(
+                    "\t"
+                )
+            ):
+
+                if (
+                    stripped.startswith(
+                        "column "
+                    )
+                    or stripped.startswith(
+                        "measure "
+                    )
+                    or stripped.startswith(
+                        "partition "
+                    )
+                    or stripped.startswith(
+                        "table "
+                    )
+                ):
+                    break
+
+            block.append(line)
+
+            index += 1
+
+        return "\n".join(
+            block
+        )
+
+    @staticmethod
+    def _collect_multiline_expression(
+        lines,
+        index,
+        initial_expression,
+    ):
+
+        expression_lines = []
+
+        if initial_expression:
+
+            expression_lines.append(
+                initial_expression.strip()
+            )
+
+        next_index = index + 1
+
+        while next_index < len(lines):
+
+            next_line = lines[
+                next_index
+            ]
+
+            stripped_next = (
+                next_line.strip()
+            )
+
+            if not stripped_next:
+
+                next_index += 1
+
+                continue
+
+            if stripped_next.startswith(
+                "measure "
+            ):
+                break
+
+            if stripped_next.startswith(
+                "column "
+            ):
+                break
+
+            if stripped_next.startswith(
+                "partition "
+            ):
+                break
+
+            if stripped_next.startswith(
+                "table "
+            ):
+                break
+
+            if re.match(
+                r"^\s*\w+\s*[:=]",
+                stripped_next,
+            ):
+                break
+
+            if (
+                not next_line.startswith(
+                    " "
+                )
+                and not next_line.startswith(
+                    "\t"
+                )
+            ):
+                break
+
+            expression_lines.append(
+                stripped_next
+            )
+
+            next_index += 1
+
+        return "\n".join(
+            expression_lines
+        ).strip()
 
 
-# ===========================================================================
-# SEMANTIC TABLES
-# ===========================================================================
+# ============================================================================
+# DAX DEPENDENCY ANALYZER
+# ============================================================================
 
+class DaxDependencyAnalyzer:
 
-def load_semantic_tables(
-    cursor,
-    semantic_model_id,
-    tables,
-):
-
-    semantic_table_lookup = {}
-
-    cursor.execute(
-        """
-        SELECT
-            SemanticTableID,
-            TableName
-        FROM dbo.MetadataSemanticTable
-        WHERE SemanticModelID = ?
-        """,
-        semantic_model_id,
+    TABLE_COLUMN_PATTERN = re.compile(
+        r"'([^']+)'\s*\[\s*([^\]]+)\s*\]"
     )
 
-    for (
-        semantic_table_id,
-        table_name,
-    ) in cursor.fetchall():
+    BARE_MEASURE_PATTERN = re.compile(
+        r"(?<!['\w])"
+        r"\[\s*([^\]]+)\s*\]"
+    )
 
-        semantic_table_lookup[
-            table_name
-        ] = int(semantic_table_id)
+    @classmethod
+    def analyze_expression(
+        cls,
+        expression,
+    ):
 
-    inserted = 0
+        expression = (
+            expression or ""
+        )
 
-    for table in tables:
+        table_columns = []
 
-        table_name = table["table_name"]
-        table_type = table["table_type"]
-        definition_path = table["definition_path"]
+        for match in cls.TABLE_COLUMN_PATTERN.finditer(
+            expression
+        ):
 
-        semantic_table_id = (
-            semantic_table_lookup.get(
-                table_name
+            table_columns.append(
+                {
+                    "table":
+                        match.group(1),
+
+                    "column":
+                        match.group(2).strip(),
+                }
+            )
+
+        measure_references = []
+
+        for match in cls.BARE_MEASURE_PATTERN.finditer(
+            expression
+        ):
+
+            name = match.group(
+                1
+            ).strip()
+
+            if name:
+
+                measure_references.append(
+                    name
+                )
+
+        return {
+            "table_columns":
+                cls._deduplicate_dicts(
+                    table_columns
+                ),
+
+            "measure_references":
+                sorted(
+                    set(
+                        measure_references
+                    ),
+                    key=str.lower,
+                ),
+        }
+
+    @classmethod
+    def analyze_calculated_column(
+        cls,
+        column,
+    ):
+
+        return cls.analyze_expression(
+            column.get(
+                "expression"
             )
         )
 
-        if semantic_table_id is None:
+    @classmethod
+    def analyze_calculated_table(
+        cls,
+        table,
+    ):
 
-            cursor.execute(
+        return cls.analyze_expression(
+            table.get(
+                "expression"
+            )
+        )
+
+    @staticmethod
+    def _deduplicate_dicts(
+        items,
+    ):
+
+        seen = set()
+
+        result = []
+
+        for item in items:
+
+            key = (
+                item.get("table"),
+                item.get("column"),
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            result.append(item)
+
+        return result
+
+
+# ============================================================================
+# PHYSICAL REPOSITORY VALIDATOR
+# ============================================================================
+
+class RepositoryValidator:
+
+    """
+    Reads the existing physical metadata repository.
+
+    Supports:
+
+        server
+        database
+        schema
+        table
+        column
+
+    No physical metadata is modified here.
+    """
+
+    def __init__(
+        self,
+        cursor,
+    ):
+
+        self.cursor = cursor
+
+        self.tables = {}
+
+        self.columns = defaultdict(
+            set
+        )
+
+        self.loaded_databases = set()
+
+    # ========================================================================
+    # LOAD DATABASE
+    # ========================================================================
+
+    def load_source_metadata(
+        self,
+        database_name,
+        server_name,
+    ):
+
+        database_key = (
+            str(server_name).lower(),
+            str(database_name).lower(),
+        )
+
+        if database_key in (
+            self.loaded_databases
+        ):
+
+            return
+
+        self.cursor.execute(
+            """
+            SELECT
+                DatabaseID
+            FROM dbo.MetadataDatabase
+            WHERE LOWER(DatabaseName) = LOWER(?)
+              AND LOWER(ServerName) = LOWER(?)
+            """,
+            database_name,
+            server_name,
+        )
+
+        row = self.cursor.fetchone()
+
+        if not row:
+
+            logging.warning(
+                "Physical database not found: %s / %s",
+                server_name,
+                database_name,
+            )
+
+            return
+
+        database_id = int(
+            row[0]
+        )
+
+        self.cursor.execute(
+            """
+            SELECT
+                TableID,
+                SchemaName,
+                TableName
+            FROM dbo.MetadataTable
+            WHERE DatabaseID = ?
+            """,
+            database_id,
+        )
+
+        for (
+            table_id,
+            schema_name,
+            table_name,
+        ) in self.cursor.fetchall():
+
+            key = (
+                str(server_name).lower(),
+                str(database_name).lower(),
+                str(schema_name).lower(),
+                str(table_name).lower(),
+            )
+
+            self.tables[key] = {
+                "table_id":
+                    int(table_id),
+
+                "server":
+                    server_name,
+
+                "database":
+                    database_name,
+
+                "schema":
+                    schema_name,
+
+                "table":
+                    table_name,
+            }
+
+        self.cursor.execute(
+            """
+            SELECT
+                t.SchemaName,
+                t.TableName,
+                c.ColumnName
+            FROM dbo.MetadataColumn c
+            INNER JOIN dbo.MetadataTable t
+                ON c.TableID = t.TableID
+            WHERE t.DatabaseID = ?
+            """,
+            database_id,
+        )
+
+        for (
+            schema_name,
+            table_name,
+            column_name,
+        ) in self.cursor.fetchall():
+
+            key = (
+                str(server_name).lower(),
+                str(database_name).lower(),
+                str(schema_name).lower(),
+                str(table_name).lower(),
+            )
+
+            self.columns[
+                key
+            ].add(
+                str(column_name)
+            )
+
+        self.loaded_databases.add(
+            database_key
+        )
+
+    # ========================================================================
+    # TABLE
+    # ========================================================================
+
+    def find_table(
+        self,
+        server_name,
+        database_name,
+        schema_name,
+        table_name,
+    ):
+
+        if not all(
+            [
+                server_name,
+                database_name,
+                schema_name,
+                table_name,
+            ]
+        ):
+            return None
+
+        key = (
+            str(server_name).lower(),
+            str(database_name).lower(),
+            str(schema_name).lower(),
+            str(table_name).lower(),
+        )
+
+        return self.tables.get(
+            key
+        )
+
+    # ========================================================================
+    # COLUMN
+    # ========================================================================
+
+    def find_column(
+        self,
+        server_name,
+        database_name,
+        schema_name,
+        table_name,
+        column_name,
+    ):
+
+        table = self.find_table(
+            server_name,
+            database_name,
+            schema_name,
+            table_name,
+        )
+
+        if not table:
+            return False
+
+        key = (
+            str(server_name).lower(),
+            str(database_name).lower(),
+            str(schema_name).lower(),
+            str(table_name).lower(),
+        )
+
+        return any(
+            str(column).lower()
+            == str(column_name).lower()
+            for column in self.columns.get(
+                key,
+                set(),
+            )
+        )
+
+
+# ============================================================================
+# METADATA REPOSITORY WRITER
+# ============================================================================
+
+class MetadataRepositoryWriter:
+
+    """
+    V6.3 repository persistence layer.
+
+    Writes semantic metadata and workspace metadata.
+
+    Existing physical metadata tables are read-only.
+
+    Workspace-aware:
+        Every semantic model is stored with its Fabric workspace ID/name.
+    """
+
+    def __init__(
+        self,
+        cursor,
+    ):
+
+        self.cursor = cursor
+
+    # ========================================================================
+    # WORKSPACE
+    # ========================================================================
+
+    def upsert_workspace(
+        self,
+        workspace_id,
+        workspace_name,
+        is_enabled=True,
+    ):
+        """
+        Insert a workspace if it does not exist.
+
+        Otherwise update the existing workspace.
+
+        MetadataWorkspace schema:
+
+            WorkspaceID
+            WorkspaceName
+            IsEnabled
+        """
+
+        if not workspace_id:
+            raise ValueError(
+                "workspace_id is required."
+            )
+
+        if not workspace_name:
+            raise ValueError(
+                "workspace_name is required."
+            )
+
+        self.cursor.execute(
+            """
+            SELECT
+                WorkspaceID
+            FROM dbo.MetadataWorkspace
+            WHERE WorkspaceID = ?
+            """,
+            workspace_id,
+        )
+
+        row = self.cursor.fetchone()
+
+        if row:
+
+            self.cursor.execute(
+                """
+                UPDATE dbo.MetadataWorkspace
+                SET
+                    WorkspaceName = ?,
+                    IsEnabled = ?
+                WHERE WorkspaceID = ?
+                """,
+                workspace_name,
+                1 if is_enabled else 0,
+                workspace_id,
+            )
+
+            logging.info(
+                "Workspace updated: %s | %s",
+                workspace_name,
+                workspace_id,
+            )
+
+        else:
+
+            self.cursor.execute(
+                """
+                INSERT INTO dbo.MetadataWorkspace
+                (
+                    WorkspaceID,
+                    WorkspaceName,
+                    IsEnabled
+                )
+                VALUES
+                (
+                    ?, ?, ?
+                )
+                """,
+                workspace_id,
+                workspace_name,
+                1 if is_enabled else 0,
+            )
+
+            logging.info(
+                "Workspace inserted: %s | %s",
+                workspace_name,
+                workspace_id,
+            )
+
+    # ========================================================================
+    # SEMANTIC MODEL
+    # ========================================================================
+
+    def get_or_create_model(
+        self,
+        model,
+    ):
+
+        fabric_model_id = (
+            model["fabric_model_id"]
+        )
+
+        self.cursor.execute(
+            """
+            SELECT
+                SemanticModelID
+            FROM dbo.MetadataSemanticModel
+            WHERE FabricModelID = ?
+            """,
+            fabric_model_id,
+        )
+
+        row = self.cursor.fetchone()
+
+        if row:
+
+            semantic_model_id = int(
+                row[0]
+            )
+
+            self.cursor.execute(
+                """
+                UPDATE dbo.MetadataSemanticModel
+                SET
+                    ModelName = ?,
+                    WorkspaceID = ?,
+                    WorkspaceName = ?,
+                    SourceType = ?
+                WHERE SemanticModelID = ?
+                """,
+                model[
+                    "semantic_model_name"
+                ],
+                model[
+                    "workspace_id"
+                ],
+                model[
+                    "workspace_name"
+                ],
+                "FABRIC_SEMANTIC_MODEL",
+                semantic_model_id,
+            )
+
+            return semantic_model_id
+
+        self.cursor.execute(
+            """
+            INSERT INTO dbo.MetadataSemanticModel
+            (
+                ModelName,
+                WorkspaceID,
+                WorkspaceName,
+                FabricModelID,
+                SourceType
+            )
+            VALUES
+            (
+                ?, ?, ?, ?, ?
+            )
+            """,
+            model[
+                "semantic_model_name"
+            ],
+            model[
+                "workspace_id"
+            ],
+            model[
+                "workspace_name"
+            ],
+            fabric_model_id,
+            "FABRIC_SEMANTIC_MODEL",
+        )
+
+        self.cursor.execute(
+            """
+            SELECT
+                SemanticModelID
+            FROM dbo.MetadataSemanticModel
+            WHERE FabricModelID = ?
+            """,
+            fabric_model_id,
+        )
+
+        row = self.cursor.fetchone()
+
+        if not row:
+
+            raise RuntimeError(
+                "Failed to retrieve newly created SemanticModelID."
+            )
+
+        return int(
+            row[0]
+        )
+
+    # ========================================================================
+    # CLEAR MODEL CHILDREN
+    # ========================================================================
+
+    def clear_model_metadata(
+        self,
+        semantic_model_id,
+    ):
+
+        self.cursor.execute(
+            """
+            DELETE FROM dbo.MetadataSemanticRelationship
+            WHERE SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
+
+        self.cursor.execute(
+            """
+            DELETE D
+            FROM dbo.MetadataMeasureDependency D
+            INNER JOIN dbo.MetadataMeasure M
+                ON D.MeasureID = M.MeasureID
+            WHERE M.SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
+
+        self.cursor.execute(
+            """
+            DELETE FROM dbo.MetadataMeasure
+            WHERE SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
+
+        self.cursor.execute(
+            """
+            DELETE D
+            FROM dbo.MetadataSemanticTableDependency D
+            INNER JOIN dbo.MetadataSemanticTable T
+                ON D.SemanticTableID = T.SemanticTableID
+            WHERE T.SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
+
+        self.cursor.execute(
+            """
+            DELETE D
+            FROM dbo.MetadataSemanticColumnDependency D
+            INNER JOIN dbo.MetadataSemanticColumn C
+                ON D.SourceSemanticColumnID =
+                   C.SemanticColumnID
+            INNER JOIN dbo.MetadataSemanticTable T
+                ON C.SemanticTableID =
+                   T.SemanticTableID
+            WHERE T.SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
+
+        self.cursor.execute(
+            """
+            DELETE S
+            FROM dbo.MetadataSemanticColumnSource S
+            INNER JOIN dbo.MetadataSemanticColumn C
+                ON S.SemanticColumnID =
+                   C.SemanticColumnID
+            INNER JOIN dbo.MetadataSemanticTable T
+                ON C.SemanticTableID =
+                   T.SemanticTableID
+            WHERE T.SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
+
+        self.cursor.execute(
+            """
+            DELETE S
+            FROM dbo.MetadataSemanticTableSource S
+            INNER JOIN dbo.MetadataSemanticTable T
+                ON S.SemanticTableID =
+                   T.SemanticTableID
+            WHERE T.SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
+
+        self.cursor.execute(
+            """
+            DELETE C
+            FROM dbo.MetadataSemanticColumn C
+            INNER JOIN dbo.MetadataSemanticTable T
+                ON C.SemanticTableID =
+                   T.SemanticTableID
+            WHERE T.SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
+
+        self.cursor.execute(
+            """
+            DELETE FROM dbo.MetadataSemanticTable
+            WHERE SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
+
+    # ========================================================================
+    # INSERT TABLES
+    # ========================================================================
+
+    def insert_tables(
+        self,
+        semantic_model_id,
+        tables,
+    ):
+
+        table_ids = {}
+
+        for table in tables:
+
+            self.cursor.execute(
                 """
                 INSERT INTO dbo.MetadataSemanticTable
                 (
                     SemanticModelID,
                     TableName,
                     TableType,
-                    DefinitionPath
+                    DefinitionPath,
+                    IsHidden
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES
+                (
+                    ?, ?, ?, ?, ?
+                )
                 """,
                 semantic_model_id,
-                table_name,
-                table_type,
-                definition_path,
+                table[
+                    "table_name"
+                ],
+                table[
+                    "table_type"
+                ],
+                table[
+                    "definition_path"
+                ],
+                table[
+                    "is_hidden"
+                ],
             )
 
-            cursor.connection.commit()
-
-            cursor.execute(
+            self.cursor.execute(
                 """
-                SELECT MAX(SemanticTableID)
+                SELECT
+                    SemanticTableID
                 FROM dbo.MetadataSemanticTable
                 WHERE SemanticModelID = ?
                   AND TableName = ?
                 """,
                 semantic_model_id,
-                table_name,
+                table[
+                    "table_name"
+                ],
             )
 
-            result = cursor.fetchone()
+            row = self.cursor.fetchone()
 
-            if not result or result[0] is None:
+            if not row:
 
                 raise RuntimeError(
-                    f"Could not retrieve SemanticTableID "
-                    f"for {table_name}"
+                    "Could not retrieve SemanticTableID for "
+                    f"{table['table_name']}"
                 )
 
-            semantic_table_id = int(
-                result[0]
+            table_ids[
+                table[
+                    "table_name"
+                ].lower()
+            ] = int(
+                row[0]
             )
 
-            semantic_table_lookup[
-                table_name
-            ] = semantic_table_id
+        return table_ids
 
-            inserted += 1
+    # ========================================================================
+    # INSERT COLUMNS
+    # ========================================================================
 
-        else:
+    def insert_columns(
+        self,
+        table_ids,
+        columns,
+    ):
 
-            cursor.execute(
-                """
-                UPDATE dbo.MetadataSemanticTable
-                SET
-                    TableType = ?,
-                    DefinitionPath = ?
-                WHERE SemanticTableID = ?
-                """,
-                table_type,
-                definition_path,
-                semantic_table_id,
+        column_ids = {}
+
+        for column in columns:
+
+            table_key = column[
+                "table_name"
+            ].lower()
+
+            semantic_table_id = (
+                table_ids.get(
+                    table_key
+                )
             )
 
-    cursor.connection.commit()
+            if not semantic_table_id:
+                continue
 
-    logging.info(
-        "Semantic tables inserted: %d",
-        inserted,
-    )
-
-    return semantic_table_lookup
-
-
-# ===========================================================================
-# SOURCE TABLE LOOKUP
-# ===========================================================================
-
-
-def build_source_table_lookup(
-    cursor,
-    database_id,
-):
-
-    cursor.execute(
-        """
-        SELECT
-            TableID,
-            SchemaName,
-            TableName
-        FROM dbo.MetadataTable
-        WHERE DatabaseID = ?
-        """,
-        database_id,
-    )
-
-    return {
-        (
-            schema_name,
-            table_name,
-        ): int(table_id)
-
-        for (
-            table_id,
-            schema_name,
-            table_name,
-        ) in cursor.fetchall()
-    }
-
-
-# ===========================================================================
-# SEMANTIC TABLE -> SOURCE TABLE
-# ===========================================================================
-
-
-def load_semantic_table_sources(
-    cursor,
-    semantic_table_lookup,
-    source_table_lookup,
-):
-
-    inserted = 0
-
-    cursor.execute(
-        """
-        SELECT
-            SemanticTableID,
-            TableName,
-            TableType
-        FROM dbo.MetadataSemanticTable
-        WHERE SemanticTableID IN ({})
-        """.format(
-            ",".join(
-                "?" for _ in semantic_table_lookup.values()
-            )
-        ),
-        *semantic_table_lookup.values(),
-    )
-
-    semantic_tables = cursor.fetchall()
-
-    for (
-        semantic_table_id,
-        semantic_table_name,
-        table_type,
-    ) in semantic_tables:
-
-        if table_type != "Source":
-
-            continue
-
-        parts = semantic_table_name.split(
-            " ",
-            1,
-        )
-
-        if len(parts) != 2:
-
-            continue
-
-        schema_name = parts[0]
-        table_name = parts[1]
-
-        source_table_id = source_table_lookup.get(
-            (
-                schema_name,
-                table_name,
-            )
-        )
-
-        if source_table_id is None:
-
-            logging.debug(
-                "No source SQL table found for semantic table %s",
-                semantic_table_name,
-            )
-
-            continue
-
-        cursor.execute(
-            """
-            SELECT 1
-            FROM dbo.MetadataSemanticTableSource
-            WHERE SemanticTableID = ?
-              AND TableID = ?
-            """,
-            semantic_table_id,
-            source_table_id,
-        )
-
-        if cursor.fetchone():
-
-            continue
-
-        cursor.execute(
-            """
-            INSERT INTO dbo.MetadataSemanticTableSource
-            (
-                SemanticTableID,
-                TableID
-            )
-            VALUES (?, ?)
-            """,
-            semantic_table_id,
-            source_table_id,
-        )
-
-        inserted += 1
-
-    cursor.connection.commit()
-
-    logging.info(
-        "Semantic-to-source table links inserted: %d",
-        inserted,
-    )
-
-    return inserted
-
-
-# ===========================================================================
-# SEMANTIC COLUMNS
-# ===========================================================================
-
-
-def load_semantic_columns(
-    cursor,
-    semantic_table_lookup,
-    columns,
-):
-
-    semantic_column_lookup = {}
-
-    semantic_table_ids = list(
-        semantic_table_lookup.values()
-    )
-
-    if not semantic_table_ids:
-
-        return semantic_column_lookup
-
-    cursor.execute(
-        """
-        SELECT
-            SemanticColumnID,
-            SemanticTableID,
-            ColumnName
-        FROM dbo.MetadataSemanticColumn
-        WHERE SemanticTableID IN ({})
-        """.format(
-            ",".join(
-                "?" for _ in semantic_table_ids
-            )
-        ),
-        *semantic_table_ids,
-    )
-
-    for (
-        semantic_column_id,
-        semantic_table_id,
-        column_name,
-    ) in cursor.fetchall():
-
-        semantic_column_lookup[
-            (
-                int(semantic_table_id),
-                column_name,
-            )
-        ] = int(semantic_column_id)
-
-    inserted = 0
-
-    for column in columns:
-
-        table_name = column["table_name"]
-        column_name = column["column_name"]
-        definition_path = column["definition_path"]
-
-        semantic_table_id = (
-            semantic_table_lookup.get(
-                table_name
-            )
-        )
-
-        if semantic_table_id is None:
-
-            continue
-
-        key = (
-            semantic_table_id,
-            column_name,
-        )
-
-        semantic_column_id = (
-            semantic_column_lookup.get(
-                key
-            )
-        )
-
-        if semantic_column_id is None:
-
-            cursor.execute(
+            self.cursor.execute(
                 """
                 INSERT INTO dbo.MetadataSemanticColumn
                 (
                     SemanticTableID,
                     ColumnName,
-                    DefinitionPath
+                    DefinitionPath,
+                    ColumnType,
+                    IsHidden
                 )
-                VALUES (?, ?, ?)
+                VALUES
+                (
+                    ?, ?, ?, ?, ?
+                )
                 """,
                 semantic_table_id,
-                column_name,
-                definition_path,
+                column[
+                    "column_name"
+                ],
+                column[
+                    "definition_path"
+                ],
+                column[
+                    "column_type"
+                ],
+                column[
+                    "is_hidden"
+                ],
             )
 
-            cursor.connection.commit()
-
-            cursor.execute(
+            self.cursor.execute(
                 """
-                SELECT MAX(SemanticColumnID)
+                SELECT
+                    SemanticColumnID
                 FROM dbo.MetadataSemanticColumn
                 WHERE SemanticTableID = ?
                   AND ColumnName = ?
                 """,
                 semantic_table_id,
-                column_name,
+                column[
+                    "column_name"
+                ],
             )
 
-            result = cursor.fetchone()
+            row = self.cursor.fetchone()
 
-            if not result or result[0] is None:
+            if not row:
+                continue
 
-                raise RuntimeError(
-                    f"Could not retrieve SemanticColumnID "
-                    f"for {table_name}.{column_name}"
-                )
-
-            semantic_column_id = int(
-                result[0]
-            )
-
-            semantic_column_lookup[
-                key
-            ] = semantic_column_id
-
-            inserted += 1
-
-        else:
-
-            cursor.execute(
-                """
-                UPDATE dbo.MetadataSemanticColumn
-                SET DefinitionPath = ?
-                WHERE SemanticColumnID = ?
-                """,
-                definition_path,
-                semantic_column_id,
-            )
-
-    cursor.connection.commit()
-
-    logging.info(
-        "Semantic columns inserted: %d",
-        inserted,
-    )
-
-    return semantic_column_lookup
-
-
-# ===========================================================================
-# SOURCE COLUMN LOOKUP
-# ===========================================================================
-
-
-def build_source_column_lookup(
-    cursor,
-    database_id,
-):
-
-    cursor.execute(
-        """
-        SELECT
-            c.ColumnID,
-            t.SchemaName,
-            t.TableName,
-            c.ColumnName
-        FROM dbo.MetadataColumn c
-        INNER JOIN dbo.MetadataTable t
-            ON c.TableID = t.TableID
-        WHERE t.DatabaseID = ?
-        """,
-        database_id,
-    )
-
-    return {
-        (
-            schema_name,
-            table_name,
-            column_name,
-        ): int(column_id)
-
-        for (
-            column_id,
-            schema_name,
-            table_name,
-            column_name,
-        ) in cursor.fetchall()
-    }
-
-
-# ===========================================================================
-# SEMANTIC COLUMN -> SOURCE COLUMN
-# ===========================================================================
-
-
-def load_semantic_column_sources(
-    cursor,
-    semantic_column_lookup,
-    semantic_table_lookup,
-    source_column_lookup,
-):
-
-    inserted = 0
-
-    reverse_table_lookup = {
-        table_id: table_name
-        for table_name, table_id
-        in semantic_table_lookup.items()
-    }
-
-    for (
-        semantic_key,
-        semantic_column_id,
-    ) in semantic_column_lookup.items():
-
-        semantic_table_id, column_name = (
-            semantic_key
-        )
-
-        semantic_table_name = (
-            reverse_table_lookup.get(
-                semantic_table_id
-            )
-        )
-
-        if not semantic_table_name:
-
-            continue
-
-        parts = semantic_table_name.split(
-            " ",
-            1,
-        )
-
-        if len(parts) != 2:
-
-            continue
-
-        schema_name = parts[0]
-        table_name = parts[1]
-
-        source_column_id = (
-            source_column_lookup.get(
+            column_ids[
                 (
-                    schema_name,
-                    table_name,
-                    column_name,
+                    column[
+                        "table_name"
+                    ].lower(),
+                    column[
+                        "column_name"
+                    ].lower(),
+                )
+            ] = int(
+                row[0]
+            )
+
+        return column_ids
+
+    # ========================================================================
+    # TABLE SOURCES
+    # ========================================================================
+
+    def insert_table_sources(
+        self,
+        table_ids,
+        tables,
+        source_mappings,
+        repository_validator,
+    ):
+
+        mapping_by_table = {
+            item[
+                "semantic_table"
+            ].lower(): item
+            for item in source_mappings
+        }
+
+        for table in tables:
+
+            semantic_table_id = (
+                table_ids.get(
+                    table[
+                        "table_name"
+                    ].lower()
                 )
             )
-        )
 
-        if source_column_id is None:
+            if not semantic_table_id:
+                continue
 
-            continue
-
-        cursor.execute(
-            """
-            SELECT 1
-            FROM dbo.MetadataSemanticColumnSource
-            WHERE SemanticColumnID = ?
-              AND ColumnID = ?
-            """,
-            semantic_column_id,
-            source_column_id,
-        )
-
-        if cursor.fetchone():
-
-            continue
-
-        cursor.execute(
-            """
-            INSERT INTO dbo.MetadataSemanticColumnSource
-            (
-                SemanticColumnID,
-                ColumnID
-            )
-            VALUES (?, ?)
-            """,
-            semantic_column_id,
-            source_column_id,
-        )
-
-        inserted += 1
-
-    cursor.connection.commit()
-
-    logging.info(
-        "Semantic-to-source column links inserted: %d",
-        inserted,
-    )
-
-    return inserted
-
-
-# ===========================================================================
-# MEASURES
-# ===========================================================================
-
-
-def load_measures(
-    cursor,
-    semantic_model_id,
-    tables,
-    semantic_table_lookup,
-    measures,
-):
-
-    inserted = 0
-
-    # -----------------------------------------------------------------------
-    # Determine actual measure table
-    # -----------------------------------------------------------------------
-
-    measure_table_id = None
-
-    for table in tables:
-
-        if table["table_type"] != "Measure Table":
-
-            continue
-
-        table_name = table["table_name"]
-
-        measure_table_id = (
-            semantic_table_lookup.get(
-                table_name
-            )
-        )
-
-        if measure_table_id is not None:
-
-            logging.info(
-                "Detected measure table: %s",
-                table_name,
+            mapping = (
+                mapping_by_table.get(
+                    table[
+                        "table_name"
+                    ].lower()
+                )
             )
 
-            break
+            if not mapping:
+                continue
 
-    # -----------------------------------------------------------------------
-    # Load measures
-    # -----------------------------------------------------------------------
-
-    for measure in measures:
-
-        measure_name = measure[
-            "measure_name"
-        ]
-
-        expression = measure[
-            "expression"
-        ]
-
-        definition_path = measure[
-            "definition_path"
-        ]
-
-        cursor.execute(
-            """
-            SELECT
-                MeasureID
-            FROM dbo.MetadataMeasure
-            WHERE SemanticModelID = ?
-              AND MeasureName = ?
-            """,
-            semantic_model_id,
-            measure_name,
-        )
-
-        result = cursor.fetchone()
-
-        if result:
-
-            measure_id = int(
-                result[0]
+            physical_table = (
+                self._resolve_physical_table(
+                    mapping,
+                    repository_validator,
+                )
             )
 
-            cursor.execute(
+            if not physical_table:
+                continue
+
+            table_id = physical_table[
+                "table_id"
+            ]
+
+            self.cursor.execute(
                 """
-                UPDATE dbo.MetadataMeasure
-                SET
-                    SemanticTableID = ?,
-                    DAXExpression = ?,
-                    DefinitionPath = ?
-                WHERE MeasureID = ?
+                INSERT INTO dbo.MetadataSemanticTableSource
+                (
+                    SemanticTableID,
+                    TableID,
+                    ResolutionMethod,
+                    SourceExpression
+                )
+                VALUES
+                (
+                    ?, ?, ?, ?
+                )
                 """,
-                measure_table_id,
-                expression,
-                definition_path,
-                measure_id,
+                semantic_table_id,
+                table_id,
+                "SOURCE_MAPPING",
+                mapping.get(
+                    "m_expression"
+                ),
             )
 
-        else:
+    # ========================================================================
+    # COLUMN SOURCES
+    # ========================================================================
 
-            cursor.execute(
+    def insert_column_sources(
+        self,
+        column_ids,
+        columns,
+        source_mappings,
+        repository_validator,
+    ):
+
+        mapping_by_table = {
+            item[
+                "semantic_table"
+            ].lower(): item
+            for item in source_mappings
+        }
+
+        for column in columns:
+
+            if column[
+                "column_type"
+            ] != "Source":
+
+                continue
+
+            key = (
+                column[
+                    "table_name"
+                ].lower(),
+                column[
+                    "column_name"
+                ].lower(),
+            )
+
+            semantic_column_id = (
+                column_ids.get(
+                    key
+                )
+            )
+
+            if not semantic_column_id:
+                continue
+
+            mapping = (
+                mapping_by_table.get(
+                    column[
+                        "table_name"
+                    ].lower()
+                )
+            )
+
+            if not mapping:
+                continue
+
+            physical_column = (
+                mapping.get(
+                    "rename_map",
+                    {},
+                ).get(
+                    column[
+                        "column_name"
+                    ],
+                    column.get(
+                        "source_column"
+                    )
+                    or column[
+                        "column_name"
+                    ],
+                )
+            )
+
+            physical = (
+                self._resolve_physical_column(
+                    mapping,
+                    physical_column,
+                    repository_validator,
+                )
+            )
+
+            if not physical:
+                continue
+
+            self.cursor.execute(
+                """
+                INSERT INTO dbo.MetadataSemanticColumnSource
+                (
+                    SemanticColumnID,
+                    ColumnID,
+                    ResolutionMethod,
+                    SourceExpression
+                )
+                VALUES
+                (
+                    ?, ?, ?, ?
+                )
+                """,
+                semantic_column_id,
+                physical[
+                    "column_id"
+                ],
+                "POWER_QUERY_MAPPING",
+                mapping.get(
+                    "m_expression"
+                ),
+            )
+
+    # ========================================================================
+    # COLUMN DEPENDENCIES
+    # ========================================================================
+
+    def insert_column_dependencies(
+        self,
+        columns,
+        column_ids,
+    ):
+
+        for column in columns:
+
+            if column[
+                "column_type"
+            ] != "Calculated":
+
+                continue
+
+            source_id = column_ids.get(
+                (
+                    column[
+                        "table_name"
+                    ].lower(),
+                    column[
+                        "column_name"
+                    ].lower(),
+                )
+            )
+
+            if not source_id:
+                continue
+
+            dependencies = (
+                DaxDependencyAnalyzer
+                .analyze_calculated_column(
+                    column
+                )
+            )
+
+            for dependency in dependencies[
+                "table_columns"
+            ]:
+
+                target_table_id = (
+                    self._find_table_id(
+                        column_ids,
+                        dependency[
+                            "table"
+                        ],
+                    )
+                )
+
+                target_column_id = (
+                    self._find_column_id(
+                        column_ids,
+                        dependency[
+                            "table"
+                        ],
+                        dependency[
+                            "column"
+                        ],
+                    )
+                )
+
+                self.cursor.execute(
+                    """
+                    INSERT INTO dbo.MetadataSemanticColumnDependency
+                    (
+                        SourceSemanticColumnID,
+                        TargetSemanticTableID,
+                        TargetSemanticColumnID,
+                        DependencyType,
+                        DependencyExpression
+                    )
+                    VALUES
+                    (
+                        ?, ?, ?, ?, ?
+                    )
+                    """,
+                    source_id,
+                    target_table_id,
+                    target_column_id,
+                    "CALCULATED_COLUMN",
+                    column.get(
+                        "expression"
+                    ),
+                )
+
+    # ========================================================================
+    # MEASURES
+    # ========================================================================
+
+    def insert_measures(
+        self,
+        semantic_model_id,
+        table_ids,
+        measures,
+    ):
+
+        measure_ids = {}
+
+        for measure in measures:
+
+            semantic_table_id = (
+                table_ids.get(
+                    measure[
+                        "table_name"
+                    ].lower()
+                )
+            )
+
+            self.cursor.execute(
                 """
                 INSERT INTO dbo.MetadataMeasure
                 (
@@ -1574,728 +2750,966 @@ def load_measures(
                     SemanticTableID,
                     MeasureName,
                     DAXExpression,
-                    DefinitionPath
+                    DefinitionPath,
+                    IsHidden
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES
+                (
+                    ?, ?, ?, ?, ?, ?
+                )
                 """,
                 semantic_model_id,
-                measure_table_id,
-                measure_name,
-                expression,
-                definition_path,
+                semantic_table_id,
+                measure[
+                    "measure_name"
+                ],
+                measure[
+                    "expression"
+                ],
+                measure[
+                    "definition_path"
+                ],
+                measure[
+                    "is_hidden"
+                ],
             )
 
-            inserted += 1
+            self.cursor.execute(
+                """
+                SELECT
+                    MeasureID
+                FROM dbo.MetadataMeasure
+                WHERE SemanticModelID = ?
+                  AND MeasureName = ?
+                """,
+                semantic_model_id,
+                measure[
+                    "measure_name"
+                ],
+            )
 
-    cursor.connection.commit()
+            row = self.cursor.fetchone()
 
-    logging.info(
-        "Measures inserted: %d",
-        inserted,
-    )
+            if row:
 
-    return inserted
+                measure_ids[
+                    measure[
+                        "measure_name"
+                    ].lower()
+                ] = int(
+                    row[0]
+                )
 
+        return measure_ids
 
-# ===========================================================================
-# MEASURE DEPENDENCIES
-# ===========================================================================
+    # ========================================================================
+    # MEASURE DEPENDENCIES
+    # ========================================================================
 
+    def insert_measure_dependencies(
+        self,
+        measures,
+        measure_ids,
+        table_ids,
+        column_ids,
+    ):
 
-def load_measure_dependencies(
-    cursor,
-    semantic_model_id,
-    semantic_table_lookup,
-    semantic_column_lookup,
-    measures,
-):
+        for measure in measures:
 
-    inserted = 0
-    deleted = 0
+            measure_id = measure_ids.get(
+                measure[
+                    "measure_name"
+                ].lower()
+            )
 
-    column_reference_pattern = re.compile(
-        r"'([^']+)'\s*\[\s*([^\]]+?)\s*\]"
-    )
+            if not measure_id:
+                continue
 
-    for measure in measures:
+            dependencies = (
+                DaxDependencyAnalyzer
+                .analyze_expression(
+                    measure[
+                        "expression"
+                    ]
+                )
+            )
 
-        measure_name = measure[
-            "measure_name"
+            for dependency in dependencies[
+                "table_columns"
+            ]:
+
+                target_table_id = (
+                    self._find_table_id(
+                        table_ids,
+                        dependency[
+                            "table"
+                        ],
+                    )
+                )
+
+                target_column_id = (
+                    self._find_column_id(
+                        column_ids,
+                        dependency[
+                            "table"
+                        ],
+                        dependency[
+                            "column"
+                        ],
+                    )
+                )
+
+                self.cursor.execute(
+                    """
+                    INSERT INTO dbo.MetadataMeasureDependency
+                    (
+                        MeasureID,
+                        SemanticTableID,
+                        SemanticColumnID,
+                        MeasureDependencyID,
+                        DependencyType,
+                        DependencyExpression
+                    )
+                    VALUES
+                    (
+                        ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    measure_id,
+                    target_table_id,
+                    target_column_id,
+                    None,
+                    "DAX_COLUMN",
+                    measure[
+                        "expression"
+                    ],
+                )
+
+            for measure_reference in dependencies[
+                "measure_references"
+            ]:
+
+                target_measure_id = (
+                    measure_ids.get(
+                        measure_reference.lower()
+                    )
+                )
+
+                self.cursor.execute(
+                    """
+                    INSERT INTO dbo.MetadataMeasureDependency
+                    (
+                        MeasureID,
+                        SemanticTableID,
+                        SemanticColumnID,
+                        MeasureDependencyID,
+                        DependencyType,
+                        DependencyExpression
+                    )
+                    VALUES
+                    (
+                        ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    measure_id,
+                    None,
+                    None,
+                    target_measure_id,
+                    "DAX_MEASURE",
+                    measure[
+                        "expression"
+                    ],
+                )
+
+    # ========================================================================
+    # TABLE DEPENDENCIES
+    # ========================================================================
+
+    def insert_table_dependencies(
+        self,
+        calculated_tables,
+        table_ids,
+        column_ids,
+    ):
+
+        for table in calculated_tables:
+
+            source_table_id = table_ids.get(
+                table[
+                    "table_name"
+                ].lower()
+            )
+
+            if not source_table_id:
+                continue
+
+            dependencies = (
+                DaxDependencyAnalyzer
+                .analyze_calculated_table(
+                    table
+                )
+            )
+
+            for dependency in dependencies[
+                "table_columns"
+            ]:
+
+                target_table_id = (
+                    self._find_table_id(
+                        table_ids,
+                        dependency[
+                            "table"
+                        ],
+                    )
+                )
+
+                target_column_id = (
+                    self._find_column_id(
+                        column_ids,
+                        dependency[
+                            "table"
+                        ],
+                        dependency[
+                            "column"
+                        ],
+                    )
+                )
+
+                self.cursor.execute(
+                    """
+                    INSERT INTO dbo.MetadataSemanticTableDependency
+                    (
+                        SemanticTableID,
+                        TargetSemanticTableID,
+                        TargetSemanticColumnID,
+                        DependencyType,
+                        DependencyExpression
+                    )
+                    VALUES
+                    (
+                        ?, ?, ?, ?, ?
+                    )
+                    """,
+                    source_table_id,
+                    target_table_id,
+                    target_column_id,
+                    "CALCULATED_TABLE",
+                    table[
+                        "expression"
+                    ],
+                )
+
+    # ========================================================================
+    # RELATIONSHIPS
+    # ========================================================================
+
+    def insert_relationships(
+        self,
+        semantic_model_id,
+        table_ids,
+        column_ids,
+        relationships,
+    ):
+
+        for relationship in relationships:
+
+            from_table_id = (
+                self._find_table_id(
+                    table_ids,
+                    relationship[
+                        "from_table"
+                    ],
+                )
+            )
+
+            from_column_id = (
+                self._find_column_id(
+                    column_ids,
+                    relationship[
+                        "from_table"
+                    ],
+                    relationship[
+                        "from_column"
+                    ],
+                )
+            )
+
+            to_table_id = (
+                self._find_table_id(
+                    table_ids,
+                    relationship[
+                        "to_table"
+                    ],
+                )
+            )
+
+            to_column_id = (
+                self._find_column_id(
+                    column_ids,
+                    relationship[
+                        "to_table"
+                    ],
+                    relationship[
+                        "to_column"
+                    ],
+                )
+            )
+
+            if not all(
+                [
+                    from_table_id,
+                    from_column_id,
+                    to_table_id,
+                    to_column_id,
+                ]
+            ):
+                continue
+
+            self.cursor.execute(
+                """
+                INSERT INTO dbo.MetadataSemanticRelationship
+                (
+                    SemanticModelID,
+                    FromTableID,
+                    FromColumnID,
+                    ToTableID,
+                    ToColumnID
+                )
+                VALUES
+                (
+                    ?, ?, ?, ?, ?
+                )
+                """,
+                semantic_model_id,
+                from_table_id,
+                from_column_id,
+                to_table_id,
+                to_column_id,
+            )
+
+    # ========================================================================
+    # PHYSICAL TABLE RESOLUTION
+    # ========================================================================
+
+    @staticmethod
+    def _resolve_physical_table(
+        mapping,
+        repository_validator,
+    ):
+
+        source_type = mapping.get(
+            "source_type"
+        )
+
+        server = mapping.get(
+            "server"
+        )
+
+        database = mapping.get(
+            "database"
+        )
+
+        schema = mapping.get(
+            "schema"
+        )
+
+        source_table = mapping.get(
+            "source_table"
+        )
+
+        if (
+            source_type == "SQL"
+            and server
+            and database
+            and schema
+            and source_table
+        ):
+
+            physical = (
+                repository_validator.find_table(
+                    server,
+                    database,
+                    schema,
+                    source_table,
+                )
+            )
+
+            if physical:
+                return physical
+
+        return None
+
+    # ========================================================================
+    # PHYSICAL COLUMN RESOLUTION
+    # ========================================================================
+
+    @staticmethod
+    def _resolve_physical_column(
+        mapping,
+        physical_column,
+        repository_validator,
+    ):
+
+        physical_table = (
+            MetadataRepositoryWriter
+            ._resolve_physical_table(
+                mapping,
+                repository_validator,
+            )
+        )
+
+        if not physical_table:
+            return None
+
+        server = mapping[
+            "server"
         ]
 
-        dax_expression = measure[
-            "expression"
+        database = mapping[
+            "database"
         ]
+
+        schema = mapping[
+            "schema"
+        ]
+
+        source_table = mapping[
+            "source_table"
+        ]
+
+        if not repository_validator.find_column(
+            server,
+            database,
+            schema,
+            source_table,
+            physical_column,
+        ):
+            return None
+
+        column_id = (
+            MetadataRepositoryWriter
+            ._find_physical_column_id(
+                repository_validator,
+                physical_table[
+                    "table_id"
+                ],
+                physical_column,
+            )
+        )
+
+        if not column_id:
+            return None
+
+        return {
+            "table_id":
+                physical_table[
+                    "table_id"
+                ],
+
+            "column_id":
+                column_id,
+        }
+
+    @staticmethod
+    def _find_physical_column_id(
+        repository_validator,
+        table_id,
+        column_name,
+    ):
+
+        cursor = (
+            repository_validator.cursor
+        )
 
         cursor.execute(
             """
             SELECT
-                MeasureID
-            FROM dbo.MetadataMeasure
-            WHERE SemanticModelID = ?
-              AND MeasureName = ?
+                ColumnID
+            FROM dbo.MetadataColumn
+            WHERE TableID = ?
+              AND LOWER(ColumnName) = LOWER(?)
             """,
-            semantic_model_id,
-            measure_name,
-        )
-
-        result = cursor.fetchone()
-
-        if not result:
-
-            logging.warning(
-                "Could not find MeasureID for measure: %s",
-                measure_name,
-            )
-
-            continue
-
-        measure_id = int(
-            result[0]
-        )
-
-        cursor.execute(
-            """
-            DELETE FROM dbo.MetadataSemanticMeasureDependency
-            WHERE MeasureID = ?
-            """,
-            measure_id,
-        )
-
-        deleted += max(
-            cursor.rowcount,
-            0,
-        )
-
-        references = (
-            column_reference_pattern.findall(
-                dax_expression
-            )
-        )
-
-        if not references:
-
-            logging.info(
-                "No column dependencies found for measure: %s",
-                measure_name,
-            )
-
-            continue
-
-        unique_references = list(
-            dict.fromkeys(
-                references
-            )
-        )
-
-        for (
-            table_name,
+            table_id,
             column_name,
-        ) in unique_references:
-
-            semantic_table_id = (
-                semantic_table_lookup.get(
-                    table_name
-                )
-            )
-
-            if semantic_table_id is None:
-
-                logging.warning(
-                    "Could not resolve semantic table "
-                    "'%s' for measure '%s'.",
-                    table_name,
-                    measure_name,
-                )
-
-                continue
-
-            semantic_column_id = (
-                semantic_column_lookup.get(
-                    (
-                        semantic_table_id,
-                        column_name,
-                    )
-                )
-            )
-
-            if semantic_column_id is None:
-
-                logging.warning(
-                    "Could not resolve semantic column "
-                    "'%s[%s]' for measure '%s'.",
-                    table_name,
-                    column_name,
-                    measure_name,
-                )
-
-                continue
-
-            cursor.execute(
-                """
-                INSERT INTO dbo.MetadataSemanticMeasureDependency
-                (
-                    MeasureID,
-                    SemanticTableID,
-                    SemanticColumnID,
-                    DependencyType,
-                    DependencyExpression
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                measure_id,
-                semantic_table_id,
-                semantic_column_id,
-                "Column",
-                f"'{table_name}'[{column_name}]",
-            )
-
-            inserted += 1
-
-            logging.debug(
-                "Measure dependency: %s -> %s[%s]",
-                measure_name,
-                table_name,
-                column_name,
-            )
-
-    cursor.connection.commit()
-
-    logging.info(
-        "Measure dependencies inserted: %d",
-        inserted,
-    )
-
-    logging.info(
-        "Previous measure dependencies removed: %d",
-        deleted,
-    )
-
-    return inserted
-
-
-# ===========================================================================
-# SEMANTIC RELATIONSHIPS
-# ===========================================================================
-
-
-def load_semantic_relationships(
-    cursor,
-    semantic_model_id,
-    semantic_table_lookup,
-    semantic_column_lookup,
-    relationships,
-):
-
-    inserted = 0
-
-    for relationship in relationships:
-
-        from_table = relationship[
-            "from_table"
-        ]
-
-        from_column = relationship[
-            "from_column"
-        ]
-
-        to_table = relationship[
-            "to_table"
-        ]
-
-        to_column = relationship[
-            "to_column"
-        ]
-
-        from_table_id = (
-            semantic_table_lookup.get(
-                from_table
-            )
         )
 
-        to_table_id = (
-            semantic_table_lookup.get(
-                to_table
-            )
+        row = cursor.fetchone()
+
+        if not row:
+            return None
+
+        return int(
+            row[0]
         )
+
+    # ========================================================================
+    # LOOKUPS
+    # ========================================================================
+
+    @staticmethod
+    def _find_table_id(
+        table_ids,
+        table_name,
+    ):
+
+        if not table_name:
+            return None
+
+        return table_ids.get(
+            table_name.lower()
+        )
+
+    @staticmethod
+    def _find_column_id(
+        column_ids,
+        table_name,
+        column_name,
+    ):
 
         if (
-            from_table_id is None
-            or to_table_id is None
+            not table_name
+            or not column_name
         ):
+            return None
 
-            logging.warning(
-                "Could not resolve semantic relationship tables: "
-                "%s -> %s",
-                from_table,
-                to_table,
-            )
-
-            continue
-
-        from_column_id = (
-            semantic_column_lookup.get(
-                (
-                    from_table_id,
-                    from_column,
-                )
-            )
-        )
-
-        to_column_id = (
-            semantic_column_lookup.get(
-                (
-                    to_table_id,
-                    to_column,
-                )
-            )
-        )
-
-        if (
-            from_column_id is None
-            or to_column_id is None
-        ):
-
-            logging.warning(
-                "Could not resolve semantic relationship columns: "
-                "%s.%s -> %s.%s",
-                from_table,
-                from_column,
-                to_table,
-                to_column,
-            )
-
-            continue
-
-        cursor.execute(
-            """
-            SELECT 1
-            FROM dbo.MetadataSemanticRelationship
-            WHERE SemanticModelID = ?
-              AND FromTableID = ?
-              AND FromColumnID = ?
-              AND ToTableID = ?
-              AND ToColumnID = ?
-            """,
-            semantic_model_id,
-            from_table_id,
-            from_column_id,
-            to_table_id,
-            to_column_id,
-        )
-
-        if cursor.fetchone():
-
-            continue
-
-        cursor.execute(
-            """
-            INSERT INTO dbo.MetadataSemanticRelationship
+        return column_ids.get(
             (
-                SemanticModelID,
-                FromTableID,
-                FromColumnID,
-                ToTableID,
-                ToColumnID
+                table_name.lower(),
+                column_name.lower(),
             )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            semantic_model_id,
-            from_table_id,
-            from_column_id,
-            to_table_id,
-            to_column_id,
         )
 
-        inserted += 1
 
-    cursor.connection.commit()
-
-    logging.info(
-        "Semantic relationships inserted: %d",
-        inserted,
-    )
-
-    return inserted
-
-
-# ===========================================================================
-# PRINT SUMMARY
-# ===========================================================================
-
-
-def print_summary(
-    tables,
-    columns,
-    measures,
-    relationships,
-):
-
-    print()
-    print("=" * 70)
-    print("TABLE SUMMARY")
-    print("=" * 70)
-
-    source_tables = [
-        t for t in tables
-        if t["table_type"] == "Source"
-    ]
-
-    calculated_tables = [
-        t for t in tables
-        if t["table_type"] == "Calculated"
-    ]
-
-    auto_date_tables = [
-        t for t in tables
-        if t["table_type"] == "Auto Date"
-    ]
-
-    date_templates = [
-        t for t in tables
-        if t["table_type"] == "Date Template"
-    ]
-
-    measure_tables = [
-        t for t in tables
-        if t["table_type"] == "Measure Table"
-    ]
-
-    print(
-        f"Source tables:       {len(source_tables)}"
-    )
-
-    print(
-        f"Calculated tables:   {len(calculated_tables)}"
-    )
-
-    print(
-        f"Auto Date tables:    {len(auto_date_tables)}"
-    )
-
-    print(
-        f"Date templates:      {len(date_templates)}"
-    )
-
-    print(
-        f"Measure tables:      {len(measure_tables)}"
-    )
-
-    print(
-        f"Total tables:        {len(tables)}"
-    )
-
-    print()
-
-    print(
-        f"Total columns:       {len(columns)}"
-    )
-
-    print(
-        f"Total measures:      {len(measures)}"
-    )
-
-    print(
-        f"Total relationships: {len(relationships)}"
-    )
-
-
-# ===========================================================================
+# ============================================================================
 # PROCESS ONE SEMANTIC MODEL
-# ===========================================================================
-
+# ============================================================================
 
 def process_semantic_model(
     client,
-    cursor,
-    database_id,
-    fabric_model_id,
-    semantic_model_name,
+    repository_writer,
+    repository_validator,
+    model,
+    connection,
+    workspace_id,
+    workspace_name,
 ):
 
-    # =======================================================================
-    # 1. RETRIEVE SEMANTIC MODEL DEFINITION
-    # =======================================================================
-
-    print()
-    print("=" * 70)
-    print(
-        f"SEMANTIC MODEL: {semantic_model_name}"
+    semantic_model_name = (
+        model.get(
+            "displayName"
+        )
     )
-    print("=" * 70)
+
+    fabric_model_id = (
+        model.get(
+            "id"
+        )
+    )
+
+    if not fabric_model_id:
+
+        raise RuntimeError(
+            "Semantic model does not contain an ID."
+        )
 
     print()
+    print("=" * 80)
+    print(
+        f"WORKSPACE: {workspace_name}"
+    )
+    print(
+        f"WORKSPACE ID: {workspace_id}"
+    )
+    print(
+        f"PROCESSING SEMANTIC MODEL: "
+        f"{semantic_model_name}"
+    )
+    print("=" * 80)
+
+    # ========================================================================
+    # DEFINITION
+    # ========================================================================
+
     print(
         "Retrieving semantic model definition..."
     )
 
     definition = (
         client.get_semantic_model_definition(
-            WORKSPACE_ID,
+            workspace_id,
             fabric_model_id,
         )
     )
 
-    # =======================================================================
-    # 2. EXTRACT
-    # =======================================================================
-
     extractor = SemanticModelExtractor(
         definition,
-        workspace_id=WORKSPACE_ID,
+        workspace_id=workspace_id,
         semantic_model_id=fabric_model_id,
         semantic_model_name=semantic_model_name,
     )
 
-    tables = extractor.extract_tables()
+    # ========================================================================
+    # EXTRACTION
+    # ========================================================================
 
-    columns = extractor.extract_columns()
+    tables = (
+        extractor.extract_tables()
+    )
 
-    measures = extractor.extract_measures()
+    columns = (
+        extractor.extract_columns(
+            tables
+        )
+    )
+
+    measures = (
+        extractor.extract_measures(
+            tables
+        )
+    )
 
     relationships = (
         extractor.extract_relationships()
     )
 
-    # =======================================================================
-    # 3. PRINT CLASSIFICATION
-    # =======================================================================
+    source_mappings = (
+        extractor.extract_source_mappings(
+            tables
+        )
+    )
+
+    calculated_tables = (
+        extractor.extract_calculated_tables(
+            tables
+        )
+    )
 
     print()
-    print("=" * 70)
-    print("TABLE CLASSIFICATION")
-    print("=" * 70)
+    print(
+        f"Tables discovered:        {len(tables)}"
+    )
 
-    for table in tables:
+    print(
+        f"Columns discovered:       {len(columns)}"
+    )
+
+    print(
+        f"Measures discovered:      {len(measures)}"
+    )
+
+    print(
+        f"Relationships discovered: {len(relationships)}"
+    )
+
+    print(
+        f"Source mappings:           {len(source_mappings)}"
+    )
+
+    print(
+        f"Calculated tables:        {len(calculated_tables)}"
+    )
+
+    # ========================================================================
+    # PHYSICAL SOURCE LOADING
+    # ========================================================================
+
+    for mapping in source_mappings:
+
+        if (
+            mapping.get(
+                "server"
+            )
+            and mapping.get(
+                "database"
+            )
+        ):
+
+            repository_validator.load_source_metadata(
+                database_name=mapping[
+                    "database"
+                ],
+                server_name=mapping[
+                    "server"
+                ],
+            )
+
+    # ========================================================================
+    # DATABASE TRANSACTION
+    # ========================================================================
+
+    try:
+
+        # --------------------------------------------------------------------
+        # Workspace
+        #
+        # The workspace is upserted before the semantic model.
+        # --------------------------------------------------------------------
+
+        repository_writer.upsert_workspace(
+            workspace_id=workspace_id,
+            workspace_name=workspace_name,
+            is_enabled=True,
+        )
+
+        # --------------------------------------------------------------------
+        # Semantic model
+        # --------------------------------------------------------------------
+
+        semantic_model_id = (
+            repository_writer.get_or_create_model(
+                {
+                    "semantic_model_name":
+                        semantic_model_name,
+
+                    "workspace_id":
+                        workspace_id,
+
+                    "workspace_name":
+                        workspace_name,
+
+                    "fabric_model_id":
+                        fabric_model_id,
+                }
+            )
+        )
 
         print(
-            f"- {table['table_name']}"
-            f" | Type: {table['table_type']}"
+            f"Repository SemanticModelID: "
+            f"{semantic_model_id}"
         )
 
-    print_summary(
-        tables,
-        columns,
-        measures,
-        relationships,
-    )
+        # --------------------------------------------------------------------
+        # Rebuild children
+        # --------------------------------------------------------------------
 
-    # =======================================================================
-    # 4. SEMANTIC MODEL
-    # =======================================================================
-
-    print()
-    print(
-        "Loading semantic model..."
-    )
-
-    semantic_model_id = (
-        get_semantic_model_id(
-            cursor,
-            semantic_model_name,
-            fabric_model_id,
+        repository_writer.clear_model_metadata(
+            semantic_model_id
         )
-    )
 
-    print(
-        f"SemanticModelID: "
-        f"{semantic_model_id}"
-    )
+        # --------------------------------------------------------------------
+        # Tables
+        # --------------------------------------------------------------------
 
-    # =======================================================================
-    # 5. SEMANTIC TABLES
-    # =======================================================================
+        table_ids = (
+            repository_writer.insert_tables(
+                semantic_model_id,
+                tables,
+            )
+        )
 
-    print()
-    print(
-        "Loading semantic tables..."
-    )
+        # --------------------------------------------------------------------
+        # Columns
+        # --------------------------------------------------------------------
 
-    semantic_table_lookup = (
-        load_semantic_tables(
-            cursor,
-            semantic_model_id,
+        column_ids = (
+            repository_writer.insert_columns(
+                table_ids,
+                columns,
+            )
+        )
+
+        # --------------------------------------------------------------------
+        # Table sources
+        # --------------------------------------------------------------------
+
+        repository_writer.insert_table_sources(
+            table_ids,
             tables,
+            source_mappings,
+            repository_validator,
         )
-    )
 
-    # =======================================================================
-    # 6. SOURCE TABLE LINKS
-    # =======================================================================
+        # --------------------------------------------------------------------
+        # Column sources
+        # --------------------------------------------------------------------
 
-    print(
-        "Linking semantic tables to SQL tables..."
-    )
-
-    source_table_lookup = (
-        build_source_table_lookup(
-            cursor,
-            database_id,
-        )
-    )
-
-    load_semantic_table_sources(
-        cursor,
-        semantic_table_lookup,
-        source_table_lookup,
-    )
-
-    # =======================================================================
-    # 7. SEMANTIC COLUMNS
-    # =======================================================================
-
-    print(
-        "Loading semantic columns..."
-    )
-
-    semantic_column_lookup = (
-        load_semantic_columns(
-            cursor,
-            semantic_table_lookup,
+        repository_writer.insert_column_sources(
+            column_ids,
             columns,
+            source_mappings,
+            repository_validator,
         )
-    )
 
-    # =======================================================================
-    # 8. SOURCE COLUMN LINKS
-    # =======================================================================
+        # --------------------------------------------------------------------
+        # Calculated column dependencies
+        # --------------------------------------------------------------------
 
-    print(
-        "Linking semantic columns to SQL columns..."
-    )
-
-    source_column_lookup = (
-        build_source_column_lookup(
-            cursor,
-            database_id,
+        repository_writer.insert_column_dependencies(
+            columns,
+            column_ids,
         )
-    )
 
-    load_semantic_column_sources(
-        cursor,
-        semantic_column_lookup,
-        semantic_table_lookup,
-        source_column_lookup,
-    )
+        # --------------------------------------------------------------------
+        # Measures
+        # --------------------------------------------------------------------
 
-    # =======================================================================
-    # 9. MEASURES
-    # =======================================================================
+        measure_ids = (
+            repository_writer.insert_measures(
+                semantic_model_id,
+                table_ids,
+                measures,
+            )
+        )
 
-    print()
-    print(
-        "Loading measures and DAX definitions..."
-    )
+        # --------------------------------------------------------------------
+        # Measure dependencies
+        # --------------------------------------------------------------------
 
-    load_measures(
-        cursor,
-        semantic_model_id,
-        tables,
-        semantic_table_lookup,
-        measures,
-    )
-
-    # =======================================================================
-    # 10. MEASURE DEPENDENCIES
-    # =======================================================================
-
-    print()
-    print(
-        "Loading measure dependencies..."
-    )
-
-    measure_dependencies_inserted = (
-        load_measure_dependencies(
-            cursor,
-            semantic_model_id,
-            semantic_table_lookup,
-            semantic_column_lookup,
+        repository_writer.insert_measure_dependencies(
             measures,
+            measure_ids,
+            table_ids,
+            column_ids,
         )
-    )
 
-    print(
-        f"Measure dependencies loaded: "
-        f"{measure_dependencies_inserted}"
-    )
+        # --------------------------------------------------------------------
+        # Calculated table dependencies
+        # --------------------------------------------------------------------
 
-    # =======================================================================
-    # 11. RELATIONSHIPS
-    # =======================================================================
+        repository_writer.insert_table_dependencies(
+            calculated_tables,
+            table_ids,
+            column_ids,
+        )
 
-    print(
-        "Loading semantic relationships..."
-    )
+        # --------------------------------------------------------------------
+        # Relationships
+        # --------------------------------------------------------------------
 
-    load_semantic_relationships(
-        cursor,
-        semantic_model_id,
-        semantic_table_lookup,
-        semantic_column_lookup,
-        relationships,
-    )
+        repository_writer.insert_relationships(
+            semantic_model_id,
+            table_ids,
+            column_ids,
+            relationships,
+        )
 
-    # =======================================================================
-    # FINAL MODEL SUMMARY
-    # =======================================================================
+        # --------------------------------------------------------------------
+        # Commit
+        # --------------------------------------------------------------------
 
-    print()
-    print("-" * 70)
-    print(
-        f"COMPLETED: {semantic_model_name}"
-    )
-    print("-" * 70)
+        connection.commit()
 
-    print(
-        f"Fabric Semantic Model ID: {fabric_model_id}"
-    )
+        print()
+        print(
+            "Repository update committed successfully."
+        )
 
-    print(
-        f"Repository SemanticModelID: "
-        f"{semantic_model_id}"
-    )
+    except Exception:
 
-    print(
-        f"Tables extracted:   "
-        f"{len(tables)}"
-    )
+        connection.rollback()
 
-    print(
-        f"Columns extracted:  "
-        f"{len(columns)}"
-    )
+        logging.exception(
+            "Repository transaction rolled back."
+        )
 
-    print(
-        f"Measures extracted: "
-        f"{len(measures)}"
-    )
-
-    print(
-        f"Measure dependencies:"
-        f" {measure_dependencies_inserted}"
-    )
-
-    print(
-        f"Relationships:      "
-        f"{len(relationships)}"
-    )
+        raise
 
     return {
-        "name": semantic_model_name,
-        "fabric_model_id": fabric_model_id,
-        "semantic_model_id": semantic_model_id,
-        "tables": len(tables),
-        "columns": len(columns),
-        "measures": len(measures),
-        "dependencies": measure_dependencies_inserted,
-        "relationships": len(relationships),
+        "workspace_id":
+            workspace_id,
+
+        "workspace_name":
+            workspace_name,
+
+        "semantic_model_name":
+            semantic_model_name,
+
+        "fabric_model_id":
+            fabric_model_id,
+
+        "semantic_model_id":
+            semantic_model_id,
+
+        "tables":
+            tables,
+
+        "columns":
+            columns,
+
+        "measures":
+            measures,
+
+        "relationships":
+            relationships,
+
+        "source_mappings":
+            source_mappings,
+
+        "calculated_tables":
+            calculated_tables,
     }
 
 
-# ===========================================================================
-# MAIN
-# ===========================================================================
+# ============================================================================
+# PRINT SUMMARY
+# ============================================================================
 
+def print_model_summary(
+    result,
+):
+
+    print()
+    print("-" * 80)
+
+    print(
+        f"WORKSPACE: "
+        f"{result['workspace_name']}"
+    )
+
+    print(
+        f"Workspace ID: "
+        f"{result['workspace_id']}"
+    )
+
+    print(
+        f"MODEL: "
+        f"{result['semantic_model_name']}"
+    )
+
+    print(
+        f"Repository ID: "
+        f"{result['semantic_model_id']}"
+    )
+
+    print(
+        f"Fabric ID: "
+        f"{result['fabric_model_id']}"
+    )
+
+    print(
+        f"Tables: "
+        f"{len(result['tables'])}"
+    )
+
+    print(
+        f"Columns: "
+        f"{len(result['columns'])}"
+    )
+
+    print(
+        f"Measures: "
+        f"{len(result['measures'])}"
+    )
+
+    print(
+        f"Relationships: "
+        f"{len(result['relationships'])}"
+    )
+
+    print(
+        f"Source mappings: "
+        f"{len(result['source_mappings'])}"
+    )
+
+    print(
+        f"Calculated tables: "
+        f"{len(result['calculated_tables'])}"
+    )
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
 
@@ -2304,74 +3718,144 @@ def main():
         format=LOG_FORMAT,
     )
 
-    print("=" * 70)
-    print("FABRIC SEMANTIC MODEL METADATA EXTRACTOR")
-    print("=" * 70)
+    print("=" * 80)
+    print(
+        "FABRIC SEMANTIC MODEL METADATA EXTRACTOR V6.3"
+    )
+    print("=" * 80)
 
-    repository_connection = None
+    # ========================================================================
+    # LOAD WORKSPACES
+    # ========================================================================
+
+    print()
+    print(
+        "Loading workspace configuration..."
+    )
+
+    workspaces = (
+        load_enabled_workspaces()
+    )
+
+    print()
+    print(
+        f"Enabled workspaces: "
+        f"{len(workspaces)}"
+    )
+
+    for index, workspace in enumerate(
+        workspaces,
+        start=1,
+    ):
+
+        print(
+            f"{index}. "
+            f"{workspace['workspace_name']}"
+            f" | "
+            f"{workspace['workspace_id']}"
+        )
+
+    print()
+
+    print(
+        "IMPORTANT:"
+    )
+
+    print(
+        "Only the workspaces listed above with "
+        "enabled=true will be processed."
+    )
+
+    print()
+
+    print(
+        "Workspace metadata will automatically be "
+        "inserted/updated in dbo.MetadataWorkspace."
+    )
+
+    print()
+
+    print(
+        "Architecture:"
+    )
+
+    print(
+        "Configured Fabric Workspaces"
+    )
+
+    print(
+        "        ↓"
+    )
+
+    print(
+        "dbo.MetadataWorkspace"
+    )
+
+    print(
+        "        ↓"
+    )
+
+    print(
+        "Fabric REST API / TMDL"
+    )
+
+    print(
+        "        ↓"
+    )
+
+    print(
+        "SemanticModelExtractor V6.3"
+    )
+
+    print(
+        "        ↓"
+    )
+
+    print(
+        "MetadataRepositoryWriter"
+    )
+
+    print(
+        "        ↓"
+    )
+
+    print(
+        "MetadataRepository Warehouse"
+    )
+
+    print()
+
+    connection = None
 
     try:
 
-        # ===================================================================
-        # 1. CREATE FABRIC CLIENT
-        # ===================================================================
+        # ====================================================================
+        # FABRIC CLIENT
+        # ====================================================================
+
+        print(
+            "Creating Fabric client..."
+        )
 
         client = FabricClient()
 
-        # ===================================================================
-        # 2. DISCOVER ALL SEMANTIC MODELS
-        # ===================================================================
+        # ====================================================================
+        # REPOSITORY CONNECTION
+        # ====================================================================
 
         print()
-        print("=" * 70)
-        print("DISCOVERING SEMANTIC MODELS")
-        print("=" * 70)
-
-        semantic_models = client.get_items_by_type(
-            WORKSPACE_ID,
-            "SemanticModel",
-        )
-
+        print("=" * 80)
         print(
-            f"Semantic models discovered: "
-            f"{len(semantic_models)}"
+            "CONNECTING TO METADATA REPOSITORY"
         )
-
-        if not semantic_models:
-
-            raise RuntimeError(
-                "No semantic models were found in the "
-                "specified Fabric workspace."
-            )
-
-        print()
-
-        for index, model in enumerate(
-            semantic_models,
-            start=1,
-        ):
-
-            print(
-                f"  {index}. "
-                f"{model.get('displayName')} "
-                f"| ID: {model.get('id')}"
-            )
-
-        # ===================================================================
-        # 3. CONNECT TO METADATA REPOSITORY
-        # ===================================================================
-
-        print()
-        print("=" * 70)
-        print("CONNECTING TO METADATA REPOSITORY")
-        print("=" * 70)
+        print("=" * 80)
 
         print()
         print(
             "A Microsoft Entra login window should appear..."
         )
 
-        repository_connection = (
+        connection = (
             connect_to_fabric_warehouse(
                 DEFAULT_DRIVER,
                 FABRIC_SQL_SERVER,
@@ -2379,240 +3863,361 @@ def main():
             )
         )
 
-        cursor = (
-            repository_connection.cursor()
-        )
+        cursor = connection.cursor()
 
-        print()
         print(
-            "Connected to MetadataRepository successfully."
+            "Connected successfully."
         )
 
-        # ===================================================================
-        # 4. GET SOURCE DATABASE ID
-        # ===================================================================
+        # ====================================================================
+        # COMPONENTS
+        # ====================================================================
 
-        cursor.execute(
-            """
-            SELECT DatabaseID
-            FROM dbo.MetadataDatabase
-            WHERE DatabaseName = ?
-              AND ServerName = ?
-            """,
-            SOURCE_DATABASE,
-            SOURCE_SERVER,
-        )
-
-        result = cursor.fetchone()
-
-        if not result:
-
-            raise RuntimeError(
-                "Source database was not found in "
-                "MetadataDatabase. "
-                "Run the SQL metadata extractor first."
+        repository_validator = (
+            RepositoryValidator(
+                cursor
             )
-
-        database_id = int(
-            result[0]
         )
 
-        print()
-        print(
-            f"Using source DatabaseID: {database_id}"
-        )
-
-        # ===================================================================
-        # 5. PROCESS EVERY SEMANTIC MODEL
-        # ===================================================================
-
-        results = []
-        successful = 0
-        failed = 0
-
-        for model in semantic_models:
-
-            fabric_model_id = model.get("id")
-            semantic_model_name = model.get(
-                "displayName"
+        repository_writer = (
+            MetadataRepositoryWriter(
+                cursor
             )
+        )
 
-            if not fabric_model_id:
+        # ====================================================================
+        # GLOBAL RESULTS
+        # ====================================================================
 
-                logging.warning(
-                    "Skipping semantic model with no ID: %s",
-                    model,
-                )
+        all_results = []
 
-                failed += 1
-                continue
+        total_models_discovered = 0
 
-            if not semantic_model_name:
+        total_successful = 0
 
-                logging.warning(
-                    "Skipping semantic model with no display name: %s",
-                    model,
-                )
+        total_failed = 0
 
-                failed += 1
-                continue
+        total_workspaces_successful = 0
+
+        total_workspaces_failed = 0
+
+        # ====================================================================
+        # PROCESS EACH ENABLED WORKSPACE
+        # ====================================================================
+
+        for workspace in workspaces:
+
+            workspace_id = workspace[
+                "workspace_id"
+            ]
+
+            workspace_name = workspace[
+                "workspace_name"
+            ]
+
+            print()
+            print()
+            print("#" * 80)
+            print(
+                f"WORKSPACE: {workspace_name}"
+            )
+            print(
+                f"WORKSPACE ID: {workspace_id}"
+            )
+            print("#" * 80)
+
+            # ================================================================
+            # REGISTER WORKSPACE IN REPOSITORY
+            # ================================================================
 
             try:
 
-                result = process_semantic_model(
-                    client=client,
-                    cursor=cursor,
-                    database_id=database_id,
-                    fabric_model_id=fabric_model_id,
-                    semantic_model_name=semantic_model_name,
+                repository_writer.upsert_workspace(
+                    workspace_id=workspace_id,
+                    workspace_name=workspace_name,
+                    is_enabled=True,
                 )
 
-                results.append(result)
+                connection.commit()
 
-                successful += 1
+                print(
+                    "Workspace metadata synchronized."
+                )
 
             except Exception:
 
-                failed += 1
+                connection.rollback()
 
                 logging.exception(
-                    "Failed to extract semantic model: %s",
-                    semantic_model_name,
+                    "Failed to synchronize workspace metadata: "
+                    "%s",
+                    workspace_name,
+                )
+
+                total_workspaces_failed += 1
+
+                continue
+
+            # ================================================================
+            # DISCOVER SEMANTIC MODELS
+            # ================================================================
+
+            print()
+            print(
+                "Discovering semantic models..."
+            )
+
+            try:
+
+                semantic_models = (
+                    client.get_items_by_type(
+                        workspace_id,
+                        "SemanticModel",
+                    )
+                )
+
+            except Exception:
+
+                logging.exception(
+                    "Failed to discover semantic models "
+                    "in workspace: %s",
+                    workspace_name,
                 )
 
                 print()
                 print(
-                    f"ERROR extracting semantic model: "
-                    f"{semantic_model_name}"
+                    f"ERROR discovering workspace: "
+                    f"{workspace_name}"
                 )
 
-                # Continue with the remaining semantic models.
+                total_workspaces_failed += 1
+
                 continue
 
-        # ===================================================================
-        # 6. FINAL SUMMARY
-        # ===================================================================
+            total_workspaces_successful += 1
+
+            print(
+                f"Semantic models discovered: "
+                f"{len(semantic_models)}"
+            )
+
+            total_models_discovered += (
+                len(semantic_models)
+            )
+
+            if not semantic_models:
+
+                print(
+                    "No semantic models found in this workspace."
+                )
+
+                continue
+
+            for index, model in enumerate(
+                semantic_models,
+                start=1,
+            ):
+
+                print(
+                    f"{index}. "
+                    f"{model.get('displayName')}"
+                    f" | "
+                    f"{model.get('id')}"
+                )
+
+            # ================================================================
+            # PROCESS MODELS
+            # ================================================================
+
+            for model in semantic_models:
+
+                try:
+
+                    result = (
+                        process_semantic_model(
+                            client,
+                            repository_writer,
+                            repository_validator,
+                            model,
+                            connection,
+                            workspace_id,
+                            workspace_name,
+                        )
+                    )
+
+                    all_results.append(
+                        result
+                    )
+
+                    total_successful += 1
+
+                except Exception as exc:
+
+                    total_failed += 1
+
+                    logging.exception(
+                        "Failed semantic model: %s "
+                        "in workspace: %s",
+                        model.get(
+                            "displayName"
+                        ),
+                        workspace_name,
+                    )
+
+                    print()
+                    print(
+                        f"ERROR: "
+                        f"{model.get('displayName')}"
+                    )
+
+                    print(
+                        f"Workspace: "
+                        f"{workspace_name}"
+                    )
+
+                    print(
+                        str(exc)
+                    )
+
+        # ====================================================================
+        # FINAL SUMMARY
+        # ====================================================================
 
         print()
-        print("=" * 70)
+        print()
+        print("=" * 80)
         print(
-            "SEMANTIC MODEL EXTRACTION COMPLETED"
+            "V6.3 EXTRACTION SUMMARY"
         )
-        print("=" * 70)
-
-        print(
-            f"Semantic models discovered: "
-            f"{len(semantic_models)}"
-        )
-
-        print(
-            f"Semantic models successful:  "
-            f"{successful}"
-        )
-
-        print(
-            f"Semantic models failed:      "
-            f"{failed}"
-        )
+        print("=" * 80)
 
         print()
 
-        for result in results:
+        print(
+            f"Configured workspaces:       "
+            f"{len(workspaces)}"
+        )
 
-            print(
-                f"Semantic model: "
-                f"{result['name']}"
-            )
+        print(
+            f"Workspaces synchronized:     "
+            f"{total_workspaces_successful}"
+        )
 
-            print(
-                f"  Fabric Model ID: "
-                f"{result['fabric_model_id']}"
-            )
+        print(
+            f"Workspace failures:          "
+            f"{total_workspaces_failed}"
+        )
 
-            print(
-                f"  Repository ID:    "
-                f"{result['semantic_model_id']}"
-            )
+        print(
+            f"Semantic models discovered:  "
+            f"{total_models_discovered}"
+        )
 
-            print(
-                f"  Tables:           "
-                f"{result['tables']}"
-            )
+        print(
+            f"Successfully processed:      "
+            f"{total_successful}"
+        )
 
-            print(
-                f"  Columns:          "
-                f"{result['columns']}"
-            )
+        print(
+            f"Failed:                      "
+            f"{total_failed}"
+        )
 
-            print(
-                f"  Measures:         "
-                f"{result['measures']}"
-            )
+        # ====================================================================
+        # WORKSPACE SUMMARY
+        # ====================================================================
 
-            print(
-                f"  Dependencies:     "
-                f"{result['dependencies']}"
-            )
+        print()
+        print(
+            "WORKSPACES PROCESSED"
+        )
 
-            print(
-                f"  Relationships:    "
-                f"{result['relationships']}"
-            )
+        print(
+            "-" * 80
+        )
+
+        for workspace in workspaces:
+
+            workspace_results = [
+                result
+                for result in all_results
+                if result[
+                    "workspace_id"
+                ]
+                == workspace[
+                    "workspace_id"
+                ]
+            ]
 
             print()
-
-        if failed > 0:
-
-            logging.warning(
-                "%d semantic model(s) failed extraction.",
-                failed,
+            print(
+                f"Workspace: "
+                f"{workspace['workspace_name']}"
             )
 
-        if successful == 0:
-
-            raise RuntimeError(
-                "No semantic models were extracted successfully."
+            print(
+                f"Workspace ID: "
+                f"{workspace['workspace_id']}"
             )
 
-        print(
-            "Metadata successfully loaded into "
-            "MetadataRepository."
-        )
+            print(
+                f"Models successfully processed: "
+                f"{len(workspace_results)}"
+            )
 
-        return 0
+        # ====================================================================
+        # MODEL DETAILS
+        # ====================================================================
 
-    except Exception as exc:
+        for result in all_results:
 
-        logging.exception(
-            "Semantic model extraction failed"
-        )
+            print_model_summary(
+                result
+            )
 
         print()
-        print(
-            "ERROR:",
-            str(exc),
+        print("=" * 80)
+
+        if (
+            total_failed == 0
+            and total_workspaces_failed == 0
+        ):
+
+            print(
+                "V6.3 EXTRACTION COMPLETED SUCCESSFULLY"
+            )
+
+        else:
+
+            print(
+                "V6.3 EXTRACTION COMPLETED WITH ERRORS"
+            )
+
+        print("=" * 80)
+
+    except Exception:
+
+        logging.exception(
+            "Semantic model extraction failed."
         )
 
-        return 1
+        raise
 
     finally:
 
-        if repository_connection:
+        if connection:
 
-            repository_connection.close()
+            connection.close()
 
             logging.info(
-                "Closed MetadataRepository connection."
+                "MetadataRepository connection closed."
             )
 
 
-# ===========================================================================
+# ============================================================================
 # ENTRY POINT
-# ===========================================================================
-
+# ============================================================================
 
 if __name__ == "__main__":
 
-    raise SystemExit(
-        main()
-    )
+    main()
