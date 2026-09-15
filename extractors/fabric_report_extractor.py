@@ -1,3 +1,18 @@
+# FULL CORRECTED REPORT EXTRACTOR V2
+#
+# Key filter correction:
+#   - Visual fields/projections are NOT automatically treated as filters.
+#   - Only actual persisted filter definitions are extracted.
+#   - TopN and Advanced filters are preserved.
+#   - PBIR visual filterConfig is read from the visual.json root.
+#   - Page/report filterConfig is recognized separately where supported.
+#   - _parse_filter_field(), _has_filter_target() and all filter helpers
+#     are instance methods, avoiding the previous TypeError.
+#
+# Existing field extraction, semantic model resolution, batch loading,
+# Unicode handling, and lineage logic are preserved.
+
+
 import base64
 import json
 import logging
@@ -48,8 +63,15 @@ FABRIC_SQL_SERVER = (
     "j7mjaqg22d2ujb27llpciiyism-7jnw46tiqcde5cpv233ctk345u.datawarehouse.fabric.microsoft.com"
 )
 
-# Fabric Warehouse database name
 FABRIC_SQL_DATABASE = "MetadataRepository"
+
+# -------------------------------------------------------------------------
+# DEBUG / DEVELOPMENT SETTING
+# Set to a report name to process only that report.
+# Set to None to process all reports.
+# -------------------------------------------------------------------------
+
+TARGET_REPORT_NAME = None
 
 
 # ============================================================================
@@ -74,6 +96,7 @@ UUID_PATTERN = re.compile(
 
 
 def is_uuid(value):
+
     if value is None:
         return False
 
@@ -85,9 +108,11 @@ def is_uuid(value):
 # ============================================================================
 
 def unique_preserve_order(values):
+
     result = []
 
     for value in values:
+
         if value is None:
             continue
 
@@ -100,6 +125,7 @@ def unique_preserve_order(values):
 
 
 def safe_string(value):
+
     if value is None:
         return None
 
@@ -107,19 +133,6 @@ def safe_string(value):
 
 
 def normalize_name(value):
-    """
-    Normalize names for intelligent report/semantic-model matching.
-
-    Examples:
-
-        HR Overview
-        hr_overview
-        HR-Overview
-
-    all become:
-
-        hroverview
-    """
 
     if value is None:
         return ""
@@ -136,17 +149,6 @@ def normalize_name(value):
 
 
 def tokenize_name(value):
-    """
-    Convert a name into meaningful tokens.
-
-    Example:
-
-        SM_AdventureWorks_HR
-        -> {"sm", "adventureworks", "hr"}
-
-        HR Overview
-        -> {"hr", "overview"}
-    """
 
     if value is None:
         return set()
@@ -166,9 +168,6 @@ def tokenize_name(value):
 
 
 def meaningful_tokens(value):
-    """
-    Remove generic words that are not useful for identifying a model.
-    """
 
     stop_words = {
         "sm",
@@ -194,9 +193,6 @@ def name_similarity_score(
     report_name,
     model_name,
 ):
-    """
-    Calculate a confidence score between a report and semantic model.
-    """
 
     report_tokens = meaningful_tokens(
         report_name
@@ -253,6 +249,7 @@ def get_fabric_connection_string(
     server,
     database,
 ):
+
     return (
         f"DRIVER={{{driver}}};"
         f"SERVER={server};"
@@ -260,7 +257,16 @@ def get_fabric_connection_string(
         "Authentication=ActiveDirectoryInteractive;"
         "Encrypt=yes;"
         "TrustServerCertificate=no;"
+        "LongAsMax=yes;"
     )
+
+
+def _decode_utf8_column(raw_bytes):
+
+    if raw_bytes is None:
+        return None
+
+    return raw_bytes.decode("utf-8")
 
 
 def connect_to_fabric_warehouse(
@@ -268,6 +274,7 @@ def connect_to_fabric_warehouse(
     server,
     database,
 ):
+
     connection_string = get_fabric_connection_string(
         driver,
         server,
@@ -278,8 +285,69 @@ def connect_to_fabric_warehouse(
         "Opening Microsoft Entra interactive authentication..."
     )
 
-    return pyodbc.connect(
+    connection = pyodbc.connect(
         connection_string
+    )
+
+    connection.add_output_converter(
+        pyodbc.SQL_CHAR,
+        _decode_utf8_column,
+    )
+
+    connection.add_output_converter(
+        pyodbc.SQL_VARCHAR,
+        _decode_utf8_column,
+    )
+
+    return connection
+
+
+def is_connection_failure(error):
+
+    connection_error_codes = (
+        "08S01",
+        "08003",
+        "08006",
+        "08007",
+    )
+
+    error_text = str(error)
+
+    return any(
+        code in error_text
+        for code in connection_error_codes
+    )
+
+
+def rollback_transaction(
+    connection,
+    report_name,
+):
+
+    try:
+
+        connection.rollback()
+
+    except Exception as rollback_error:
+
+        logger.warning(
+            "Could not roll back report transaction for '%s': %s",
+            report_name,
+            rollback_error,
+        )
+
+
+def execute_insert_batches(
+    cursor,
+    statement,
+    rows,
+):
+
+    cursor.fast_executemany = True
+
+    cursor.executemany(
+        statement,
+        rows,
     )
 
 
@@ -288,32 +356,41 @@ def connect_to_fabric_warehouse(
 # ============================================================================
 
 def load_enabled_workspaces():
-    """
-    Load enabled Fabric workspaces from config/workspaces.json.
-    """
 
     if not WORKSPACE_CONFIG_FILE.exists():
+
         raise FileNotFoundError(
             "Workspace configuration file not found: "
             f"{WORKSPACE_CONFIG_FILE}"
         )
 
     try:
+
         with open(
             WORKSPACE_CONFIG_FILE,
             "r",
             encoding="utf-8",
         ) as file:
+
             config = json.load(file)
+
     except json.JSONDecodeError as exc:
+
         raise RuntimeError(
             "Invalid JSON in workspace configuration file: "
             f"{WORKSPACE_CONFIG_FILE}"
         ) from exc
 
-    workspaces = config.get("workspaces", [])
+    workspaces = config.get(
+        "workspaces",
+        []
+    )
 
-    if not isinstance(workspaces, list):
+    if not isinstance(
+        workspaces,
+        list,
+    ):
+
         raise RuntimeError(
             "'workspaces' must be a list in "
             f"{WORKSPACE_CONFIG_FILE}"
@@ -322,37 +399,58 @@ def load_enabled_workspaces():
     enabled_workspaces = []
 
     for workspace in workspaces:
-        if not isinstance(workspace, dict):
+
+        if not isinstance(
+            workspace,
+            dict,
+        ):
+
             logging.warning(
                 "Ignoring invalid workspace entry: %s",
                 workspace,
             )
+
             continue
 
-        workspace_id = workspace.get("workspace_id")
-        workspace_name = workspace.get("workspace_name")
-        enabled = workspace.get("enabled", True)
+        workspace_id = workspace.get(
+            "workspace_id"
+        )
+
+        workspace_name = workspace.get(
+            "workspace_name"
+        )
+
+        enabled = workspace.get(
+            "enabled",
+            True,
+        )
 
         if not workspace_id:
+
             logging.warning(
                 "Ignoring workspace without workspace_id: %s",
                 workspace,
             )
+
             continue
 
         if not workspace_name:
+
             logging.warning(
                 "Ignoring workspace without workspace_name: %s",
                 workspace_id,
             )
+
             continue
 
         if not enabled:
+
             logging.info(
                 "Workspace disabled: %s | %s",
                 workspace_name,
                 workspace_id,
             )
+
             continue
 
         enabled_workspaces.append(
@@ -363,6 +461,7 @@ def load_enabled_workspaces():
         )
 
     if not enabled_workspaces:
+
         raise RuntimeError(
             "No enabled workspaces found in "
             f"{WORKSPACE_CONFIG_FILE}"
@@ -411,6 +510,7 @@ def get_workspace_items(
     client,
     workspace_id,
 ):
+
     response = client.get_workspace_items(
         workspace_id
     )
@@ -429,6 +529,7 @@ def get_workspace_items(
 def discover_reports_from_items(
     workspace_items,
 ):
+
     reports = []
 
     for item in workspace_items:
@@ -448,10 +549,12 @@ def discover_reports_from_items(
         )
 
         if not report_id:
+
             logger.warning(
                 "Skipping report without ID: %s",
                 item,
             )
+
             continue
 
         report_name = (
@@ -485,6 +588,7 @@ def discover_reports_from_items(
 def discover_semantic_models(
     workspace_items,
 ):
+
     models = []
 
     for item in workspace_items:
@@ -531,6 +635,7 @@ def discover_semantic_models(
 def print_workspace_inventory(
     workspace_items,
 ):
+
     logger.info(
         "Workspace inventory:"
     )
@@ -554,6 +659,7 @@ def print_workspace_inventory(
     for item_type, count in sorted(
         item_types.items()
     ):
+
         logger.info(
             "  %s=%d",
             item_type,
@@ -568,10 +674,12 @@ def print_workspace_inventory(
 def get_definition_parts(
     definition,
 ):
+
     if not isinstance(
         definition,
         dict,
     ):
+
         raise RuntimeError(
             "Report definition is not a dictionary."
         )
@@ -585,6 +693,7 @@ def get_definition_parts(
         definition_object,
         dict,
     ):
+
         return []
 
     parts = definition_object.get(
@@ -596,6 +705,7 @@ def get_definition_parts(
         parts,
         list,
     ):
+
         return []
 
     return parts
@@ -604,6 +714,7 @@ def get_definition_parts(
 def decode_definition_part(
     part,
 ):
+
     payload = part.get(
         "payload"
     )
@@ -642,6 +753,7 @@ def decode_definition_part(
 def parse_json_part(
     part,
 ):
+
     content = decode_definition_part(
         part
     )
@@ -650,11 +762,13 @@ def parse_json_part(
         return None
 
     try:
+
         return json.loads(
             content
         )
 
     except json.JSONDecodeError:
+
         return None
 
 
@@ -662,6 +776,7 @@ def save_report_definition(
     report_name,
     definition,
 ):
+
     safe_name = re.sub(
         r"[^A-Za-z0-9_.-]+",
         "_",
@@ -730,8 +845,7 @@ def collect_ids_from_key(
     )
 
     is_model_key = (
-        key_normalized in SEMANTIC_ID_KEYS
-        or (
+        (
             "semanticmodel" in key_normalized
             and "id" in key_normalized
         )
@@ -741,44 +855,81 @@ def collect_ids_from_key(
         )
     )
 
-    if not is_model_key:
-        return
+    # ---------------------------------------------------------
+    # 1. Normal JSON model/dataset ID fields
+    # ---------------------------------------------------------
+    if is_model_key:
 
-    if (
-        isinstance(value, str)
-        and is_uuid(value)
-    ):
-
-        candidates.append(
-            value
-        )
-
-    elif isinstance(
-        value,
-        dict,
-    ):
-
-        for nested_key in (
-            "id",
-            "modelId",
-            "modelID",
-            "semanticModelId",
-            "semanticModelID",
-            "datasetId",
-            "datasetID",
+        if (
+            isinstance(value, str)
+            and is_uuid(value)
         ):
 
-            nested_value = value.get(
-                nested_key
+            candidates.append(
+                value
             )
 
-            if is_uuid(
-                nested_value
+        elif isinstance(
+            value,
+            dict,
+        ):
+
+            for nested_key in (
+                "id",
+                "modelId",
+                "modelID",
+                "semanticModelId",
+                "semanticModelID",
+                "datasetId",
+                "datasetID",
             ):
 
-                candidates.append(
-                    str(nested_value)
+                nested_value = value.get(
+                    nested_key
                 )
+
+                if is_uuid(
+                    nested_value
+                ):
+
+                    candidates.append(
+                        str(nested_value)
+                    )
+
+    # ---------------------------------------------------------
+    # 2. PBIR connection strings
+    #
+    # Example:
+    # semanticmodelid=57540ac5-bb7e-4b05-93f4-e7e6e036553d
+    # ---------------------------------------------------------
+    if isinstance(
+        value,
+        str,
+    ):
+
+        patterns = (
+            r"semanticmodelid\s*=\s*([0-9a-fA-F-]{36})",
+            r"datasetid\s*=\s*([0-9a-fA-F-]{36})",
+            r"modelid\s*=\s*([0-9a-fA-F-]{36})",
+        )
+
+        for pattern in patterns:
+
+            matches = re.findall(
+                pattern,
+                value,
+                flags=re.IGNORECASE,
+            )
+
+            for match in matches:
+
+                if is_uuid(
+                    match
+                ):
+
+                    candidates.append(
+                        match
+                    )
 
 
 def collect_semantic_model_candidates(
@@ -858,6 +1009,7 @@ def extract_semantic_model_ids_from_workspace_item(
         report_item,
         dict,
     ):
+
         return []
 
     candidates = (
@@ -1052,6 +1204,7 @@ def resolve_semantic_model_for_report(
     definition,
     cursor,
     workspace_items,
+    repository_models_cache,
 ):
 
     report_name = report["name"]
@@ -1069,10 +1222,6 @@ def resolve_semantic_model_for_report(
         "Semantic models discovered in workspace: %d",
         len(semantic_models),
     )
-
-    # ========================================================================
-    # 1. EXPLICIT ID FROM REPORT DEFINITION
-    # ========================================================================
 
     definition_candidates = (
         extract_report_semantic_model_ids(
@@ -1118,10 +1267,6 @@ def resolve_semantic_model_for_report(
             "Multiple explicit semantic model candidates were found "
             "in report definition. Continuing with scoring."
         )
-
-    # ========================================================================
-    # 2. EXPLICIT ID FROM REPORT WORKSPACE ITEM
-    # ========================================================================
 
     report_item = report.get(
         "raw"
@@ -1172,19 +1317,9 @@ def resolve_semantic_model_for_report(
             "report workspace metadata. Continuing with scoring."
         )
 
-    # ========================================================================
-    # 3. REPOSITORY CROSS-REFERENCE
-    # ========================================================================
-
-    repository_models = (
-        get_repository_semantic_models(
-            cursor
-        )
-    )
-
     repository_by_fabric_id = {
         model["fabric_id"]: model
-        for model in repository_models
+        for model in repository_models_cache
         if model["fabric_id"]
     }
 
@@ -1207,10 +1342,6 @@ def resolve_semantic_model_for_report(
         )
 
         return selected
-
-    # ========================================================================
-    # 4. INTELLIGENT NAME MATCHING
-    # ========================================================================
 
     logger.info(
         "Attempting intelligent report-to-semantic-model matching..."
@@ -1270,10 +1401,6 @@ def resolve_semantic_model_for_report(
             ),
         )
 
-    # ========================================================================
-    # 5. SELECT STRONG UNIQUE MATCH
-    # ========================================================================
-
     if scored_candidates:
 
         best = scored_candidates[0]
@@ -1330,10 +1457,6 @@ def resolve_semantic_model_for_report(
                 second["score"],
             )
 
-    # ========================================================================
-    # 6. SINGLE MODEL FALLBACK
-    # ========================================================================
-
     if len(semantic_models) == 1:
 
         model = semantic_models[0]
@@ -1348,12 +1471,9 @@ def resolve_semantic_model_for_report(
 
         return model["id"]
 
-    # ========================================================================
-    # 7. FAIL SAFELY
-    # ========================================================================
-
     available_models = ", ".join(
-        f"{model['name']} [{model['id']}]"
+        f"{model['name']} [{model['id']}"
+        "]"
         for model in semantic_models
     )
 
@@ -1375,9 +1495,16 @@ class ReportMetadataExtractor:
         self,
         definition,
     ):
+
         self.definition = definition
-        self.parts = get_definition_parts(definition)
-        self.report_format = self._detect_report_format()
+
+        self.parts = get_definition_parts(
+            definition
+        )
+
+        self.report_format = (
+            self._detect_report_format()
+        )
 
         logger.info(
             "Report definition format detected: %s",
@@ -1389,72 +1516,158 @@ class ReportMetadataExtractor:
     # ========================================================================
 
     def _detect_report_format(self):
+
         paths = {
-            str(part.get("path", "")).replace("\\", "/")
+            str(
+                part.get(
+                    "path",
+                    "",
+                )
+            ).replace(
+                "\\",
+                "/",
+            )
             for part in self.parts
-            if isinstance(part, dict)
+            if isinstance(
+                part,
+                dict,
+            )
         }
 
-        if any(path.startswith("definition/pages/") for path in paths):
+        if any(
+            path.startswith(
+                "definition/pages/"
+            )
+            for path in paths
+        ):
+
             return "PBIR"
 
-        if any(path.startswith("definition/") for path in paths):
+        if any(
+            path.startswith(
+                "definition/"
+            )
+            for path in paths
+        ):
+
             return "PBIR"
 
         if "report.json" in paths:
+
             return "PBIR-Legacy"
 
         logger.warning(
             "Could not confidently detect report definition format. "
             "Falling back to PBIR parser."
         )
+
         return "PBIR"
 
     # ========================================================================
     # PART HELPERS
     # ========================================================================
 
-    def _find_part(self, path):
-        normalized_path = str(path).replace("\\", "/")
+    def _find_part(
+        self,
+        path,
+    ):
+
+        normalized_path = str(
+            path
+        ).replace(
+            "\\",
+            "/",
+        )
 
         for part in self.parts:
-            part_path = str(part.get("path", "")).replace("\\", "/")
+
+            part_path = str(
+                part.get(
+                    "path",
+                    "",
+                )
+            ).replace(
+                "\\",
+                "/",
+            )
+
             if part_path == normalized_path:
                 return part
 
         return None
 
     @staticmethod
-    def _parse_json_value(value, default=None):
+    def _parse_json_value(
+        value,
+        default=None,
+    ):
+
         if value is None:
             return default
 
-        if isinstance(value, (dict, list)):
+        if isinstance(
+            value,
+            (
+                dict,
+                list,
+            ),
+        ):
+
             return value
 
-        if isinstance(value, str):
+        if isinstance(
+            value,
+            str,
+        ):
+
             value = value.strip()
+
             if not value:
                 return default
 
             try:
-                return json.loads(value)
-            except (json.JSONDecodeError, TypeError, ValueError):
+
+                return json.loads(
+                    value
+                )
+
+            except (
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ):
+
                 return default
 
         return default
 
     def _get_legacy_report(self):
-        part = self._find_part("report.json")
+
+        part = self._find_part(
+            "report.json"
+        )
 
         if part is None:
-            logger.warning("PBIR-Legacy report.json part was not found.")
+
+            logger.warning(
+                "PBIR-Legacy report.json part was not found."
+            )
+
             return None
 
-        data = parse_json_part(part)
+        data = parse_json_part(
+            part
+        )
 
-        if not isinstance(data, dict):
-            logger.warning("PBIR-Legacy report.json could not be parsed.")
+        if not isinstance(
+            data,
+            dict,
+        ):
+
+            logger.warning(
+                "PBIR-Legacy report.json could not be parsed."
+            )
+
             return None
 
         return data
@@ -1464,33 +1677,69 @@ class ReportMetadataExtractor:
     # ========================================================================
 
     def extract_pages(self):
+
         if self.report_format == "PBIR-Legacy":
+
             return self._extract_legacy_pages()
 
         return self._extract_pbir_pages()
 
     def _extract_pbir_pages(self):
+
         pages = []
         page_order = []
 
         for part in self.parts:
-            path = str(part.get("path", "")).replace("\\", "/")
+
+            path = str(
+                part.get(
+                    "path",
+                    "",
+                )
+            ).replace(
+                "\\",
+                "/",
+            )
 
             if path != "definition/pages/pages.json":
                 continue
 
-            data = parse_json_part(part)
-            if not isinstance(data, dict):
+            data = parse_json_part(
+                part
+            )
+
+            if not isinstance(
+                data,
+                dict,
+            ):
+
                 continue
 
-            page_order = data.get("pageOrder", [])
-            if not isinstance(page_order, list):
+            page_order = data.get(
+                "pageOrder",
+                [],
+            )
+
+            if not isinstance(
+                page_order,
+                list,
+            ):
+
                 page_order = []
 
         page_data = {}
 
         for part in self.parts:
-            path = str(part.get("path", "")).replace("\\", "/")
+
+            path = str(
+                part.get(
+                    "path",
+                    "",
+                )
+            ).replace(
+                "\\",
+                "/",
+            )
 
             match = re.match(
                 r"^definition/pages/([^/]+)/page\.json$",
@@ -1500,51 +1749,103 @@ class ReportMetadataExtractor:
             if not match:
                 continue
 
-            data = parse_json_part(part)
-            if not isinstance(data, dict):
+            data = parse_json_part(
+                part
+            )
+
+            if not isinstance(
+                data,
+                dict,
+            ):
+
                 continue
 
-            page_id = data.get("name") or match.group(1)
-            page_data[str(page_id)] = data
+            page_id = (
+                data.get("name")
+                or match.group(1)
+            )
+
+            page_data[
+                str(page_id)
+            ] = data
 
         ordered_ids = []
 
         for page_id in page_order:
-            page_id = str(page_id)
-            if page_id in page_data and page_id not in ordered_ids:
-                ordered_ids.append(page_id)
+
+            page_id = str(
+                page_id
+            )
+
+            if (
+                page_id in page_data
+                and page_id not in ordered_ids
+            ):
+
+                ordered_ids.append(
+                    page_id
+                )
 
         for page_id in page_data:
-            if page_id not in ordered_ids:
-                ordered_ids.append(page_id)
 
-        for index, page_id in enumerate(ordered_ids, start=1):
-            data = page_data[page_id]
+            if page_id not in ordered_ids:
+
+                ordered_ids.append(
+                    page_id
+                )
+
+        for index, page_id in enumerate(
+            ordered_ids,
+            start=1,
+        ):
+
+            data = page_data[
+                page_id
+            ]
 
             pages.append(
                 {
                     "page_name": page_id,
-                    "display_name": data.get("displayName") or page_id,
+                    "display_name": (
+                        data.get(
+                            "displayName"
+                        )
+                        or page_id
+                    ),
                     "page_order": index,
                 }
             )
 
-        logger.info("PBIR pages discovered: %d", len(pages))
+        logger.info(
+            "PBIR pages discovered: %d",
+            len(pages),
+        )
+
         return pages
 
     def _extract_legacy_pages(self):
+
         pages = []
+
         report = self._get_legacy_report()
 
         if not report:
             return pages
 
-        sections = report.get("sections", [])
+        sections = report.get(
+            "sections",
+            []
+        )
 
-        if not isinstance(sections, list):
+        if not isinstance(
+            sections,
+            list,
+        ):
+
             logger.warning(
                 "PBIR-Legacy report.json contains no valid sections array."
             )
+
             return pages
 
         logger.info(
@@ -1552,8 +1853,16 @@ class ReportMetadataExtractor:
             len(sections),
         )
 
-        for index, section in enumerate(sections, start=1):
-            if not isinstance(section, dict):
+        for index, section in enumerate(
+            sections,
+            start=1,
+        ):
+
+            if not isinstance(
+                section,
+                dict,
+            ):
+
                 continue
 
             page_name = (
@@ -1568,26 +1877,58 @@ class ReportMetadataExtractor:
                 or page_name
             )
 
-            ordinal = section.get("ordinal")
-            if isinstance(ordinal, (int, float)):
-                page_order = int(ordinal) + 1
+            ordinal = section.get(
+                "ordinal"
+            )
+
+            if isinstance(
+                ordinal,
+                (
+                    int,
+                    float,
+                ),
+            ):
+
+                page_order = int(
+                    ordinal
+                ) + 1
+
             else:
+
                 page_order = index
 
             pages.append(
                 {
-                    "page_name": str(page_name),
-                    "display_name": str(display_name),
+                    "page_name": str(
+                        page_name
+                    ),
+                    "display_name": str(
+                        display_name
+                    ),
                     "page_order": page_order,
                 }
             )
 
-        pages.sort(key=lambda page: page.get("page_order", 999999))
+        pages.sort(
+            key=lambda page:
+            page.get(
+                "page_order",
+                999999,
+            )
+        )
 
-        for index, page in enumerate(pages, start=1):
+        for index, page in enumerate(
+            pages,
+            start=1,
+        ):
+
             page["page_order"] = index
 
-        logger.info("PBIR-Legacy pages extracted: %d", len(pages))
+        logger.info(
+            "PBIR-Legacy pages extracted: %d",
+            len(pages),
+        )
+
         return pages
 
     # ========================================================================
@@ -1595,16 +1936,28 @@ class ReportMetadataExtractor:
     # ========================================================================
 
     def extract_visuals(self):
+
         if self.report_format == "PBIR-Legacy":
+
             return self._extract_legacy_visuals()
 
         return self._extract_pbir_visuals()
 
     def _extract_pbir_visuals(self):
+
         visuals = []
 
         for part in self.parts:
-            path = str(part.get("path", "")).replace("\\", "/")
+
+            path = str(
+                part.get(
+                    "path",
+                    "",
+                )
+            ).replace(
+                "\\",
+                "/",
+            )
 
             match = re.match(
                 r"^definition/pages/([^/]+)/visuals/([^/]+)/visual\.json$",
@@ -1615,50 +1968,99 @@ class ReportMetadataExtractor:
                 continue
 
             page_name = match.group(1)
-            visual_id_from_path = match.group(2)
-            data = parse_json_part(part)
 
-            if not isinstance(data, dict):
+            visual_id_from_path = match.group(2)
+
+            data = parse_json_part(
+                part
+            )
+
+            if not isinstance(
+                data,
+                dict,
+            ):
+
                 continue
 
-            visual_id = data.get("name") or visual_id_from_path
-            visual_definition = data.get("visual", {})
+            visual_id = (
+                data.get("name")
+                or visual_id_from_path
+            )
 
-            if not isinstance(visual_definition, dict):
+            visual_definition = data.get(
+                "visual",
+                {},
+            )
+
+            if not isinstance(
+                visual_definition,
+                dict,
+            ):
+
                 visual_definition = {}
 
             visual_type = (
-                visual_definition.get("visualType")
-                or data.get("visualType")
+                visual_definition.get(
+                    "visualType"
+                )
+                or data.get(
+                    "visualType"
+                )
                 or "Unknown"
             )
 
             visuals.append(
                 {
                     "page_name": page_name,
-                    "fabric_visual_id": str(visual_id),
-                    "visual_type": str(visual_type),
+                    "fabric_visual_id": str(
+                        visual_id
+                    ),
+                    "visual_type": str(
+                        visual_type
+                    ),
                     "definition_path": path,
                     "raw": data,
                 }
             )
 
-        logger.info("PBIR visuals discovered: %d", len(visuals))
+        logger.info(
+            "PBIR visuals discovered: %d",
+            len(visuals),
+        )
+
         return visuals
 
     def _extract_legacy_visuals(self):
+
         visuals = []
+
         report = self._get_legacy_report()
 
         if not report:
             return visuals
 
-        sections = report.get("sections", [])
-        if not isinstance(sections, list):
+        sections = report.get(
+            "sections",
+            []
+        )
+
+        if not isinstance(
+            sections,
+            list,
+        ):
+
             return visuals
 
-        for section_index, section in enumerate(sections, start=1):
-            if not isinstance(section, dict):
+        for section_index, section in enumerate(
+            sections,
+            start=1,
+        ):
+
+            if not isinstance(
+                section,
+                dict,
+            ):
+
                 continue
 
             page_name = (
@@ -1667,60 +2069,123 @@ class ReportMetadataExtractor:
                 or f"Page_{section_index}"
             )
 
-            visual_containers = section.get("visualContainers", [])
-            if not isinstance(visual_containers, list):
+            visual_containers = (
+                section.get(
+                    "visualContainers",
+                    []
+                )
+            )
+
+            if not isinstance(
+                visual_containers,
+                list,
+            ):
+
                 continue
 
             for visual_index, container in enumerate(
                 visual_containers,
                 start=1,
             ):
-                if not isinstance(container, dict):
+
+                if not isinstance(
+                    container,
+                    dict,
+                ):
+
                     continue
 
                 visual_id = (
                     container.get("id")
                     or container.get("name")
-                    or f"{page_name}_visual_{visual_index}"
+                    or (
+                        f"{page_name}_visual_"
+                        f"{visual_index}"
+                    )
                 )
 
                 config = self._parse_json_value(
-                    container.get("config"),
+                    container.get(
+                        "config"
+                    ),
                     default={},
                 )
-                if not isinstance(config, dict):
+
+                if not isinstance(
+                    config,
+                    dict,
+                ):
+
                     config = {}
 
-                single_visual = config.get("singleVisual", {})
-                if not isinstance(single_visual, dict):
+                single_visual = config.get(
+                    "singleVisual",
+                    {},
+                )
+
+                if not isinstance(
+                    single_visual,
+                    dict,
+                ):
+
                     single_visual = {}
 
                 visual_type = (
-                    single_visual.get("visualType")
-                    or config.get("visualType")
-                    or container.get("visualType")
+                    single_visual.get(
+                        "visualType"
+                    )
+                    or config.get(
+                        "visualType"
+                    )
+                    or container.get(
+                        "visualType"
+                    )
                     or "Unknown"
                 )
 
                 query = self._parse_json_value(
-                    container.get("query"),
+                    container.get(
+                        "query"
+                    ),
                     default={},
                 )
-                if not isinstance(query, dict):
+
+                if not isinstance(
+                    query,
+                    dict,
+                ):
+
                     query = {}
 
-                legacy_filters = self._parse_json_value(
-                    container.get("filters"),
-                    default=[],
+                legacy_filters = (
+                    self._parse_json_value(
+                        container.get(
+                            "filters"
+                        ),
+                        default=[],
+                    )
                 )
 
-                if isinstance(legacy_filters, dict):
-                    legacy_filters = [legacy_filters]
-                elif not isinstance(legacy_filters, list):
+                if isinstance(
+                    legacy_filters,
+                    dict,
+                ):
+
+                    legacy_filters = [
+                        legacy_filters
+                    ]
+
+                elif not isinstance(
+                    legacy_filters,
+                    list,
+                ):
+
                     legacy_filters = []
 
                 normalized_raw = {
-                    "name": str(visual_id),
+                    "name": str(
+                        visual_id
+                    ),
                     "visual": {
                         "visualType": visual_type,
                         "query": query,
@@ -1743,9 +2208,15 @@ class ReportMetadataExtractor:
 
                 visuals.append(
                     {
-                        "page_name": str(page_name),
-                        "fabric_visual_id": str(visual_id),
-                        "visual_type": str(visual_type),
+                        "page_name": str(
+                            page_name
+                        ),
+                        "fabric_visual_id": str(
+                            visual_id
+                        ),
+                        "visual_type": str(
+                            visual_type
+                        ),
                         "definition_path": "report.json",
                         "raw": normalized_raw,
                     }
@@ -1755,271 +2226,1115 @@ class ReportMetadataExtractor:
             "PBIR-Legacy visuals discovered: %d",
             len(visuals),
         )
+
         return visuals
 
     # ========================================================================
     # VISUAL FIELDS
     # ========================================================================
 
-    def extract_visual_fields(self, visual):
+    def extract_visual_fields(
+        self,
+        visual,
+    ):
+
         if self.report_format == "PBIR-Legacy":
-            return self._extract_legacy_visual_fields(visual)
 
-        return self._extract_pbir_visual_fields(visual)
+            return self._extract_legacy_visual_fields(
+                visual
+            )
 
-    def _extract_pbir_visual_fields(self, visual):
+        return self._extract_pbir_visual_fields(
+            visual
+        )
+
+    def _extract_pbir_visual_fields(
+        self,
+        visual,
+    ):
+
         result = []
 
-        raw = visual.get("raw", {})
-        visual_definition = raw.get("visual", {})
-        if not isinstance(visual_definition, dict):
+        raw = visual.get(
+            "raw",
+            {}
+        )
+
+        visual_definition = raw.get(
+            "visual",
+            {}
+        )
+
+        if not isinstance(
+            visual_definition,
+            dict,
+        ):
+
             return result
 
-        query = visual_definition.get("query", {})
-        if not isinstance(query, dict):
+        query = visual_definition.get(
+            "query",
+            {}
+        )
+
+        if not isinstance(
+            query,
+            dict,
+        ):
+
             return result
 
-        query_state = query.get("queryState", {})
-        if not isinstance(query_state, dict):
+        query_state = query.get(
+            "queryState",
+            {}
+        )
+
+        if not isinstance(
+            query_state,
+            dict,
+        ):
+
             return result
 
         for projection_area, state in query_state.items():
-            if not isinstance(state, dict):
+
+            if not isinstance(
+                state,
+                dict,
+            ):
+
                 continue
 
-            projections = state.get("projections", [])
-            if not isinstance(projections, list):
+            projections = state.get(
+                "projections",
+                []
+            )
+
+            if not isinstance(
+                projections,
+                list,
+            ):
+
                 continue
 
             for projection in projections:
-                if not isinstance(projection, dict):
+
+                if not isinstance(
+                    projection,
+                    dict,
+                ):
+
                     continue
 
-                field = projection.get("field", {})
-                field_metadata = self._parse_field(field)
+                field = projection.get(
+                    "field",
+                    {}
+                )
+
+                field_metadata = self._parse_field(
+                    field
+                )
+                # -------------------------------------------------------------------------
+                # Legacy aggregation / summarization
+                #
+                # NativeReferenceName contains the user-facing Power BI field name,
+                # including the selected summarization, e.g.:
+                #
+                #     "First Country"
+                #
+                # while the internal query may contain:
+                #
+                #     "Min(dim_LegalEntity.Country)"
+                #
+                # The internal Function / Name must therefore NOT be treated as the
+                # user-facing aggregation when NativeReferenceName is available.
+                # -------------------------------------------------------------------------
+
+                if (
+                    field_metadata
+                    and field_metadata.get("field_type") == "Column"
+                ):
+
+                    native_reference_name = select_item.get(
+                        "NativeReferenceName"
+                    )
+
+                    if isinstance(
+                        native_reference_name,
+                        str,
+                    ):
+
+                        native_reference_name = (
+                            native_reference_name.strip()
+                        )
+
+                        aggregation_match = re.match(
+                            r"^\s*(First|Last|Sum|Average|Min|Max|Count|CountRows|DistinctCount)\b",
+                            native_reference_name,
+                            re.IGNORECASE,
+                        )
+
+                        if aggregation_match:
+
+                            field_metadata[
+                                "aggregation_function"
+                            ] = aggregation_match.group(
+                                1
+                            ).upper()
 
                 if not field_metadata:
                     continue
 
-                field_metadata["projection_area"] = projection_area
-                field_metadata["query_ref"] = projection.get("queryRef")
-                field_metadata["native_query_ref"] = projection.get(
+                field_metadata[
+                    "projection_area"
+                ] = projection_area
+
+                field_metadata[
+                    "query_ref"
+                ] = projection.get(
+                    "queryRef"
+                )
+
+                field_metadata[
+                    "native_query_ref"
+                ] = projection.get(
                     "nativeQueryRef"
                 )
 
-                result.append(field_metadata)
+                if (
+                    field_metadata.get("column_name")
+                    in {
+                        "Country",
+                        "LegalEntityCode",
+                    }
+                ):
+
+                    logger.warning(
+                        "PBIR FIELD BEFORE RESULT: %s",
+                        field_metadata,
+                    )
+
+
+
+                result.append(
+                    field_metadata
+                )
 
         return result
 
-    def _extract_legacy_visual_fields(self, visual):
+
+    def _extract_pbir_visual_fields(
+        self,
+        visual,
+    ):
+
         result = []
-        raw = visual.get("raw", {})
-        query = raw.get("legacyQuery", {})
 
-        select_items = self._extract_legacy_select_items(query)
+        raw = visual.get(
+            "raw",
+            {}
+        )
 
-        # Some legacy visuals keep the semantic query in config rather than
-        # in the container's query property.
-        if not select_items and isinstance(raw, dict):
-            legacy_config = raw.get("legacyConfig", {})
-            if isinstance(legacy_config, dict):
-                single_visual = legacy_config.get("singleVisual", {})
-                if isinstance(single_visual, dict):
-                    for query_candidate in (
-                        single_visual.get("prototypeQuery"),
-                        single_visual.get("query"),
-                    ):
-                        select_items = self._extract_legacy_select_items(
-                            query_candidate
-                        )
-                        if select_items:
-                            break
+        visual_definition = raw.get(
+            "visual",
+            {}
+        )
 
-        source_entities = self._extract_legacy_source_entities(query)
-        if not source_entities and isinstance(raw, dict):
-            source_entities = self._extract_legacy_source_entities(
-                raw.get("legacyConfig", {}).get("singleVisual", {})
-                if isinstance(raw.get("legacyConfig", {}), dict)
-                else {}
+        if not isinstance(
+            visual_definition,
+            dict,
+        ):
+            return result
+
+        query = visual_definition.get(
+            "query",
+            {}
+        )
+
+        if not isinstance(
+            query,
+            dict,
+        ):
+            return result
+
+        query_state = query.get(
+            "queryState",
+            {}
+        )
+
+        if not isinstance(
+            query_state,
+            dict,
+        ):
+            return result
+
+        for projection_area, state in query_state.items():
+
+            if not isinstance(
+                state,
+                dict,
+            ):
+                continue
+
+            projections = state.get(
+                "projections",
+                []
             )
 
+            if not isinstance(
+                projections,
+                list,
+            ):
+                continue
+
+            for projection in projections:
+
+                if not isinstance(
+                    projection,
+                    dict,
+                ):
+                    continue
+
+                field = projection.get(
+                    "field",
+                    {}
+                )
+
+                field_metadata = self._parse_field(
+                    field
+                )
+
+                if not field_metadata:
+                    continue
+
+                # -------------------------------------------------------------
+                # Projection / role metadata
+                # -------------------------------------------------------------
+
+                field_metadata[
+                    "projection_area"
+                ] = projection_area
+
+                # -------------------------------------------------------------
+                # Query reference
+                # -------------------------------------------------------------
+
+                field_metadata[
+                    "query_ref"
+                ] = projection.get(
+                    "queryRef"
+                )
+
+                # -------------------------------------------------------------
+                # Native query reference
+                # -------------------------------------------------------------
+
+                field_metadata[
+                    "native_query_ref"
+                ] = projection.get(
+                    "nativeQueryRef"
+                )
+
+                result.append(
+                    field_metadata
+                )
+
+        return result
+
+
+    def _extract_legacy_visual_fields(
+        self,
+        visual,
+    ):
+
+        result = []
+
+        raw = visual.get(
+            "raw",
+            {}
+        )
+
+        if not isinstance(
+            raw,
+            dict,
+        ):
+            return result
+
+        # -------------------------------------------------------------------------
+        # Find the query that contains the visual's select items.
+        #
+        # For PBIR-Legacy visuals, the query may be stored in:
+        #
+        #   1. legacyQuery
+        #   2. legacyConfig.singleVisual.prototypeQuery
+        #   3. legacyConfig.singleVisual.query
+        #
+        # We keep the exact query candidate that produced the select_items.
+        # This is important because the From -> Entity definitions must come
+        # from the same query.
+        # -------------------------------------------------------------------------
+
+        query_candidates = []
+
+        legacy_query = raw.get(
+            "legacyQuery",
+            {}
+        )
+
+        if isinstance(
+            legacy_query,
+            (dict, list, str),
+        ):
+            query_candidates.append(
+                legacy_query
+            )
+
+        legacy_config = raw.get(
+            "legacyConfig",
+            {}
+        )
+
+        single_visual = {}
+
+        if isinstance(
+            legacy_config,
+            dict,
+        ):
+
+            candidate_single_visual = (
+                legacy_config.get(
+                    "singleVisual",
+                    {}
+                )
+            )
+
+            if isinstance(
+                candidate_single_visual,
+                dict,
+            ):
+                single_visual = candidate_single_visual
+
+        if isinstance(
+            single_visual,
+            dict,
+        ):
+
+            prototype_query = (
+                single_visual.get(
+                    "prototypeQuery"
+                )
+            )
+
+            if isinstance(
+                prototype_query,
+                (dict, list, str),
+            ):
+                query_candidates.append(
+                    prototype_query
+                )
+
+            visual_query = (
+                single_visual.get(
+                    "query"
+                )
+            )
+
+            if isinstance(
+                visual_query,
+                (dict, list, str),
+            ):
+                query_candidates.append(
+                    visual_query
+                )
+
+        # -------------------------------------------------------------------------
+        # Find the first query candidate that actually contains select items.
+        # -------------------------------------------------------------------------
+
+        selected_query = None
+        select_items = []
+
+        for query_candidate in query_candidates:
+
+            candidate_select_items = (
+                self._extract_legacy_select_items(
+                    query_candidate
+                )
+            )
+
+            if candidate_select_items:
+
+                selected_query = query_candidate
+
+                select_items = (
+                    candidate_select_items
+                )
+
+                break
+
+        if not select_items:
+            return result
+
+        # -------------------------------------------------------------------------
+        # Extract source aliases/entities from the SAME query that supplied
+        # the select items.
+        #
+        # Example:
+        #
+        #   From:
+        #   [
+        #       {
+        #           "Name": "d",
+        #           "Entity": "dim_LegalEntity"
+        #       }
+        #   ]
+        #
+        # becomes:
+        #
+        #   {
+        #       "d": "dim_LegalEntity"
+        #   }
+        # -------------------------------------------------------------------------
+
+        source_entities = (
+            self._extract_legacy_source_entities(
+                selected_query
+            )
+        )
+
+        # -------------------------------------------------------------------------
+        # Build field metadata.
+        # -------------------------------------------------------------------------
+
         for select_item in select_items:
-            if not isinstance(select_item, dict):
+
+            if not isinstance(
+                select_item,
+                dict,
+            ):
                 continue
 
             field = None
 
-            if isinstance(select_item.get("Column"), dict):
-                field = {"Column": select_item.get("Column")}
-            elif isinstance(select_item.get("Measure"), dict):
-                field = {"Measure": select_item.get("Measure")}
-            elif isinstance(select_item.get("Aggregation"), dict):
-                field = {"Aggregation": select_item.get("Aggregation")}
+            # -------------------------------------------------------------
+            # Normal Column
+            # -------------------------------------------------------------
+
+            if isinstance(
+                select_item.get("Column"),
+                dict,
+            ):
+
+                field = {
+                    "Column": select_item.get(
+                        "Column"
+                    )
+                }
+
+            # -------------------------------------------------------------
+            # Measure
+            # -------------------------------------------------------------
+
+            elif isinstance(
+                select_item.get("Measure"),
+                dict,
+            ):
+
+                field = {
+                    "Measure": select_item.get(
+                        "Measure"
+                    )
+                }
+
+            # -------------------------------------------------------------
+            # Aggregation
+            # -------------------------------------------------------------
+
+            elif isinstance(
+                select_item.get("Aggregation"),
+                dict,
+            ):
+
+                field = {
+                    "Aggregation": select_item.get(
+                        "Aggregation"
+                    )
+                }
 
             if field is None:
                 continue
 
-            field_metadata = self._parse_field(field)
+            # -------------------------------------------------------------
+            # Parse the actual field.
+            # -------------------------------------------------------------
+
+            field_metadata = self._parse_field(
+                field
+            )
+
             if not field_metadata:
                 continue
 
-            if not field_metadata.get("table_name"):
-                field_source = next(iter(field.values()), {})
-                expression = (
-                    field_source.get("Expression", {})
-                    if isinstance(field_source, dict)
-                    else {}
+            # ---------------------------------------------------------------------
+            # Legacy user-facing aggregation / summarization.
+            #
+            # IMPORTANT:
+            #
+            # For Legacy PBIR, the internal query can contain:
+            #
+            #   Function = 3
+            #   Name = "Min(dim_LegalEntity.Country)"
+            #
+            # while the actual Power BI user selection is:
+            #
+            #   NativeReferenceName = "First Country"
+            #
+            # Therefore:
+            #
+            #   NativeReferenceName
+            #           ↓
+            #       FIRST
+            #
+            # takes precedence over the numeric Function value and the
+            # internal Name.
+            #
+            # This is especially important for fields such as:
+            #
+            #   First Country
+            #   First LegalEntityCode
+            #
+            # which Power BI may internally represent with Min(...).
+            # ---------------------------------------------------------------------
+
+            native_reference_name = (
+                select_item.get(
+                    "NativeReferenceName"
                 )
-                source_ref = (
-                    expression.get("SourceRef", {})
-                    if isinstance(expression, dict)
-                    else {}
+            )
+
+            if (
+                field_metadata.get("field_type") == "Column"
+                and isinstance(
+                    native_reference_name,
+                    str,
                 )
-                source_alias = (
-                    source_ref.get("Source")
-                    if isinstance(source_ref, dict)
-                    else None
-                )
-                field_metadata["table_name"] = source_entities.get(
-                    source_alias,
-                    source_alias,
+            ):
+
+                native_reference_name = (
+                    native_reference_name.strip()
                 )
 
-            field_metadata["projection_area"] = (
-                select_item.get("ProjectionArea")
-                or select_item.get("Role")
+                if native_reference_name:
+
+                    aggregation_match = re.match(
+                        r"^\s*"
+                        r"(First|Last|Sum|Average|Min|Max|"
+                        r"Count|CountRows|DistinctCount)"
+                        r"\b",
+                        native_reference_name,
+                        re.IGNORECASE,
+                    )
+
+                    if aggregation_match:
+
+                        field_metadata[
+                            "aggregation_function"
+                        ] = aggregation_match.group(
+                            1
+                        ).upper()
+
+            # ---------------------------------------------------------------------
+            # Resolve table name through the source alias when the field itself
+            # does not contain the Entity directly.
+            #
+            # Column / Measure:
+            #
+            #   Expression
+            #       SourceRef
+            #           Source
+            #
+            # Aggregation:
+            #
+            #   Expression
+            #       Column
+            #           Expression
+            #               SourceRef
+            #                   Source
+            # ---------------------------------------------------------------------
+
+            if not field_metadata.get(
+                "table_name"
+            ):
+
+                field_source = next(
+                    iter(field.values()),
+                    {}
+                )
+
+                source_alias = None
+
+                if isinstance(
+                    field_source,
+                    dict,
+                ):
+
+                    # -------------------------------------------------------------
+                    # Normal Column / Measure
+                    # -------------------------------------------------------------
+
+                    expression = field_source.get(
+                        "Expression",
+                        {}
+                    )
+
+                    if isinstance(
+                        expression,
+                        dict,
+                    ):
+
+                        source_ref = expression.get(
+                            "SourceRef",
+                            {}
+                        )
+
+                        if isinstance(
+                            source_ref,
+                            dict,
+                        ):
+
+                            source_alias = (
+                                source_ref.get(
+                                    "Source"
+                                )
+                            )
+
+                    # -------------------------------------------------------------
+                    # Aggregation
+                    # -------------------------------------------------------------
+
+                    if (
+                        source_alias is None
+                        and "Aggregation" in field
+                    ):
+
+                        aggregation_expression = (
+                            field_source.get(
+                                "Expression",
+                                {}
+                            )
+                        )
+
+                        if isinstance(
+                            aggregation_expression,
+                            dict,
+                        ):
+
+                            column = (
+                                aggregation_expression.get(
+                                    "Column",
+                                    {}
+                                )
+                            )
+
+                            if isinstance(
+                                column,
+                                dict,
+                            ):
+
+                                column_expression = (
+                                    column.get(
+                                        "Expression",
+                                        {}
+                                    )
+                                )
+
+                                if isinstance(
+                                    column_expression,
+                                    dict,
+                                ):
+
+                                    source_ref = (
+                                        column_expression.get(
+                                            "SourceRef",
+                                            {}
+                                        )
+                                    )
+
+                                    if isinstance(
+                                        source_ref,
+                                        dict,
+                                    ):
+
+                                        source_alias = (
+                                            source_ref.get(
+                                                "Source"
+                                            )
+                                        )
+
+                if source_alias:
+
+                    field_metadata[
+                        "table_name"
+                    ] = source_entities.get(
+                        str(source_alias),
+                        source_alias,
+                    )
+
+            # ---------------------------------------------------------------------
+            # Projection / role metadata.
+            # ---------------------------------------------------------------------
+
+            field_metadata[
+                "projection_area"
+            ] = (
+                select_item.get(
+                    "ProjectionArea"
+                )
+                or select_item.get(
+                    "Role"
+                )
                 or "Select"
             )
 
-            field_metadata["query_ref"] = (
-                select_item.get("Name")
-                or select_item.get("QueryRef")
-                or select_item.get("queryRef")
+            # ---------------------------------------------------------------------
+            # Query reference.
+            #
+            # Keep the internal Legacy query representation here.
+            # Example:
+            #
+            #   Min(dim_LegalEntity.Country)
+            # ---------------------------------------------------------------------
+
+            field_metadata[
+                "query_ref"
+            ] = (
+                select_item.get(
+                    "Name"
+                )
+                or select_item.get(
+                    "QueryRef"
+                )
+                or select_item.get(
+                    "queryRef"
+                )
             )
 
-            field_metadata["native_query_ref"] = (
-                select_item.get("NativeQueryRef")
-                or select_item.get("nativeQueryRef")
+            # ---------------------------------------------------------------------
+            # Native query reference.
+            #
+            # This preserves the user-facing Power BI field/summarization name.
+            #
+            # Example:
+            #
+            #   First Country
+            # ---------------------------------------------------------------------
+
+            field_metadata[
+                "native_query_ref"
+            ] = (
+                select_item.get(
+                    "NativeReferenceName"
+                )
+                or select_item.get(
+                    "NativeQueryRef"
+                )
+                or select_item.get(
+                    "nativeQueryRef"
+                )
             )
 
-            result.append(field_metadata)
+            result.append(
+                field_metadata
+            )
 
         return result
 
-    def _extract_legacy_source_entities(self, query):
-        query = self._parse_json_value(query)
+
+
+    def _extract_legacy_source_entities(
+        self,
+        query,
+    ):
+
+        query = self._parse_json_value(
+            query
+        )
+
         source_entities = {}
 
         def walk(value):
-            value = self._parse_json_value(value)
 
-            if isinstance(value, dict):
-                sources = value.get("From")
-                if isinstance(sources, list):
+            value = self._parse_json_value(
+                value
+            )
+
+            if isinstance(
+                value,
+                dict,
+            ):
+
+                sources = value.get(
+                    "From"
+                )
+
+                if isinstance(
+                    sources,
+                    list,
+                ):
+
                     for source in sources:
-                        if not isinstance(source, dict):
+
+                        if not isinstance(
+                            source,
+                            dict,
+                        ):
+
                             continue
 
-                        alias = source.get("Name")
-                        entity = source.get("Entity")
+                        alias = source.get(
+                            "Name"
+                        )
+
+                        entity = source.get(
+                            "Entity"
+                        )
+
                         if alias and entity:
-                            source_entities[str(alias)] = str(entity)
+
+                            source_entities[
+                                str(alias)
+                            ] = str(entity)
 
                 for child in value.values():
+
                     walk(child)
-            elif isinstance(value, list):
+
+            elif isinstance(
+                value,
+                list,
+            ):
+
                 for child in value:
+
                     walk(child)
 
         walk(query)
+
         return source_entities
 
-    def _extract_legacy_select_items(self, query):
-        query = self._parse_json_value(query)
+    def _extract_legacy_select_items(
+        self,
+        query,
+    ):
 
-        if not isinstance(query, (dict, list)):
+        query = self._parse_json_value(
+            query
+        )
+
+        if not isinstance(
+            query,
+            (
+                dict,
+                list,
+            ),
+        ):
+
             return []
 
-        if isinstance(query, dict):
-            direct_query = query.get("Query")
-            if isinstance(direct_query, dict):
-                select_items = direct_query.get("Select")
-                if isinstance(select_items, list):
+        if isinstance(
+            query,
+            dict,
+        ):
+
+            direct_query = query.get(
+                "Query"
+            )
+
+            if isinstance(
+                direct_query,
+                dict,
+            ):
+
+                select_items = direct_query.get(
+                    "Select"
+                )
+
+                if isinstance(
+                    select_items,
+                    list,
+                ):
+
                     return select_items
 
-            commands = query.get("Commands")
-            if isinstance(commands, list):
+            commands = query.get(
+                "Commands"
+            )
+
+            if isinstance(
+                commands,
+                list,
+            ):
+
                 for command in commands:
-                    if not isinstance(command, dict):
+
+                    if not isinstance(
+                        command,
+                        dict,
+                    ):
+
                         continue
 
                     semantic_command = command.get(
                         "SemanticQueryDataShapeCommand"
                     )
 
-                    if not isinstance(semantic_command, dict):
+                    if not isinstance(
+                        semantic_command,
+                        dict,
+                    ):
+
                         continue
 
-                    command_query = semantic_command.get("Query")
-                    if not isinstance(command_query, dict):
+                    command_query = (
+                        semantic_command.get(
+                            "Query"
+                        )
+                    )
+
+                    if not isinstance(
+                        command_query,
+                        dict,
+                    ):
+
                         continue
 
-                    select_items = command_query.get("Select")
-                    if isinstance(select_items, list):
+                    select_items = (
+                        command_query.get(
+                            "Select"
+                        )
+                    )
+
+                    if isinstance(
+                        select_items,
+                        list,
+                    ):
+
                         return select_items
 
-        # Defensive recursive fallback for legacy query variations.
         found = []
 
         def walk(value):
-            value = self._parse_json_value(value)
 
-            if isinstance(value, dict):
-                select = value.get("Select")
-                if isinstance(select, list):
-                    found.extend(select)
+            value = self._parse_json_value(
+                value
+            )
+
+            if isinstance(
+                value,
+                dict,
+            ):
+
+                select = value.get(
+                    "Select"
+                )
+
+                if isinstance(
+                    select,
+                    list,
+                ):
+
+                    found.extend(
+                        select
+                    )
+
                     return True
 
                 for child in value.values():
+
                     if walk(child):
                         return True
 
-            elif isinstance(value, list):
+            elif isinstance(
+                value,
+                list,
+            ):
+
                 for child in value:
+
                     if walk(child):
                         return True
 
             return False
 
         walk(query)
+
         return found
 
     # ========================================================================
     # FIELD PARSER
     # ========================================================================
 
-    def _parse_field(self, field):
-        if not isinstance(field, dict):
+    def _parse_field(
+        self,
+        field,
+    ):
+
+        if not isinstance(
+            field,
+            dict,
+        ):
+
             return None
 
         # --------------------------------------------------------------------
         # Measure
         # --------------------------------------------------------------------
+
         if "Measure" in field:
-            measure = field.get("Measure", {})
-            if not isinstance(measure, dict):
+
+            measure = field.get(
+                "Measure",
+                {}
+            )
+
+            if not isinstance(
+                measure,
+                dict,
+            ):
+
                 return None
 
-            expression = measure.get("Expression", {})
-            if not isinstance(expression, dict):
+            expression = measure.get(
+                "Expression",
+                {}
+            )
+
+            if not isinstance(
+                expression,
+                dict,
+            ):
+
                 expression = {}
 
-            source_ref = expression.get("SourceRef", {})
-            if not isinstance(source_ref, dict):
+            source_ref = expression.get(
+                "SourceRef",
+                {}
+            )
+
+            if not isinstance(
+                source_ref,
+                dict,
+            ):
+
                 source_ref = {}
 
-            table_name = source_ref.get("Entity")
-            measure_name = measure.get("Property")
+            table_name = source_ref.get(
+                "Entity"
+            )
+
+            measure_name = measure.get(
+                "Property"
+            )
 
             if not measure_name:
                 return None
@@ -2035,21 +3350,52 @@ class ReportMetadataExtractor:
         # --------------------------------------------------------------------
         # Column
         # --------------------------------------------------------------------
+
         if "Column" in field:
-            column = field.get("Column", {})
-            if not isinstance(column, dict):
+
+            column = field.get(
+                "Column",
+                {}
+            )
+
+            if not isinstance(
+                column,
+                dict,
+            ):
+
                 return None
 
-            expression = column.get("Expression", {})
-            if not isinstance(expression, dict):
+            expression = column.get(
+                "Expression",
+                {}
+            )
+
+            if not isinstance(
+                expression,
+                dict,
+            ):
+
                 expression = {}
 
-            source_ref = expression.get("SourceRef", {})
-            if not isinstance(source_ref, dict):
+            source_ref = expression.get(
+                "SourceRef",
+                {}
+            )
+
+            if not isinstance(
+                source_ref,
+                dict,
+            ):
+
                 source_ref = {}
 
-            table_name = source_ref.get("Entity")
-            column_name = column.get("Property")
+            table_name = source_ref.get(
+                "Entity"
+            )
+
+            column_name = column.get(
+                "Property"
+            )
 
             if not column_name:
                 return None
@@ -2065,30 +3411,80 @@ class ReportMetadataExtractor:
         # --------------------------------------------------------------------
         # Aggregation
         # --------------------------------------------------------------------
+
         if "Aggregation" in field:
-            aggregation = field.get("Aggregation", {})
-            if not isinstance(aggregation, dict):
+
+            aggregation = field.get(
+                "Aggregation",
+                {}
+            )
+
+            if not isinstance(
+                aggregation,
+                dict,
+            ):
+
                 return None
 
-            expression = aggregation.get("Expression", {})
-            if not isinstance(expression, dict):
+            expression = aggregation.get(
+                "Expression",
+                {}
+            )
+
+            if not isinstance(
+                expression,
+                dict,
+            ):
+
                 expression = {}
 
-            function_code = aggregation.get("Function")
-            column = expression.get("Column", {})
-            if not isinstance(column, dict):
+            function_code = aggregation.get(
+                "Function"
+            )
+
+            column = expression.get(
+                "Column",
+                {}
+            )
+
+            if not isinstance(
+                column,
+                dict,
+            ):
+
                 column = {}
 
-            column_expression = column.get("Expression", {})
-            if not isinstance(column_expression, dict):
+            column_expression = column.get(
+                "Expression",
+                {}
+            )
+
+            if not isinstance(
+                column_expression,
+                dict,
+            ):
+
                 column_expression = {}
 
-            source_ref = column_expression.get("SourceRef", {})
-            if not isinstance(source_ref, dict):
+            source_ref = column_expression.get(
+                "SourceRef",
+                {}
+            )
+
+            if not isinstance(
+                source_ref,
+                dict,
+            ):
+
                 source_ref = {}
 
-            table_name = source_ref.get("Entity")
-            column_name = column.get("Property")
+            table_name = source_ref.get(
+                "Entity"
+            )
+
+            column_name = column.get(
+                "Property"
+            )
 
             if not column_name:
                 return None
@@ -2103,10 +3499,105 @@ class ReportMetadataExtractor:
                 ),
             }
 
+        # Date hierarchy fields retain the underlying column in a
+        # PropertyVariationSource instead of a regular Column node.
+        if "HierarchyLevel" in field:
+
+            hierarchy_level = field.get(
+                "HierarchyLevel",
+                {},
+            )
+
+            if not isinstance(
+                hierarchy_level,
+                dict,
+            ):
+
+                return None
+
+            expression = hierarchy_level.get(
+                "Expression",
+                {},
+            )
+
+            hierarchy = (
+                expression.get(
+                    "Hierarchy",
+                    {},
+                )
+                if isinstance(expression, dict)
+                else {}
+            )
+
+            hierarchy_expression = (
+                hierarchy.get(
+                    "Expression",
+                    {},
+                )
+                if isinstance(hierarchy, dict)
+                else {}
+            )
+
+            variation_source = (
+                hierarchy_expression.get(
+                    "PropertyVariationSource",
+                    {},
+                )
+                if isinstance(hierarchy_expression, dict)
+                else {}
+            )
+
+            variation_expression = (
+                variation_source.get(
+                    "Expression",
+                    {},
+                )
+                if isinstance(variation_source, dict)
+                else {}
+            )
+
+            source_ref = (
+                variation_expression.get(
+                    "SourceRef",
+                    {},
+                )
+                if isinstance(variation_expression, dict)
+                else {}
+            )
+
+            table_name = (
+                source_ref.get(
+                    "Entity"
+                )
+                if isinstance(source_ref, dict)
+                else None
+            )
+
+            column_name = (
+                variation_source.get(
+                    "Property"
+                )
+                if isinstance(variation_source, dict)
+                else None
+            )
+
+            if table_name and column_name:
+
+                return {
+                    "field_type": "Column",
+                    "table_name": table_name,
+                    "column_name": column_name,
+                    "measure_name": None,
+                    "aggregation_function": None,
+                }
+
         return None
 
     @staticmethod
-    def _aggregation_name(function_code):
+    def _aggregation_name(
+        function_code,
+    ):
+
         mapping = {
             0: "SUM",
             1: "AVERAGE",
@@ -2120,81 +3611,901 @@ class ReportMetadataExtractor:
 
         return mapping.get(
             function_code,
-            str(function_code) if function_code is not None else None,
+            (
+                str(function_code)
+                if function_code is not None
+                else None
+            ),
         )
 
     # ========================================================================
     # FILTERS
+    #
+    # IMPORTANT:
+    #
+    # A field being present in a visual does NOT mean it is a filter.
+    #
+    # We therefore require evidence that the filter definition actually
+    # represents a persisted filter:
+    #
+    #   1. explicit filter expression / Where
+    #   2. actual filter payload
+    #   3. meaningful howCreated metadata
+    #
+    # This preserves TopN / Advanced filters while eliminating the
+    # field-only entries that previously appeared as filters.
     # ========================================================================
 
-    def extract_visual_filters(self, visual):
+    def extract_visual_filters(
+        self,
+        visual,
+    ):
+
         if self.report_format == "PBIR-Legacy":
-            return self._extract_legacy_visual_filters(visual)
 
-        return self._extract_pbir_visual_filters(visual)
+            return self._extract_legacy_visual_filters(
+                visual
+            )
 
-    def _extract_pbir_visual_filters(self, visual):
+        return self._extract_pbir_visual_filters(
+            visual
+        )
+
+    # ========================================================================
+    # FILTER FIELD PARSER
+    # ========================================================================
+
+    def _parse_filter_field(
+        self,
+        field,
+    ):
+        """
+        Parse the field/target associated with a filter.
+
+        This is deliberately an INSTANCE method.
+
+        Previous broken version called:
+
+            cls._parse_filter_field(field)
+
+        while the method required:
+
+            self, field
+
+        That caused:
+
+            TypeError:
+            missing 1 required positional argument: 'field'
+        """
+
+        if not isinstance(
+            field,
+            dict,
+        ):
+
+            return None
+
+        # Normal PBIR field structure.
+        parsed = self._parse_field(
+            field
+        )
+
+        if parsed:
+            return parsed
+
+        # Some filter definitions can expose the target in slightly
+        # different structures. Try common wrappers defensively.
+
+        for key in (
+            "field",
+            "target",
+            "expression",
+            "Field",
+            "Target",
+            "Expression",
+        ):
+
+            nested = field.get(
+                key
+            )
+
+            if not isinstance(
+                nested,
+                dict,
+            ):
+
+                continue
+
+            parsed = self._parse_field(
+                nested
+            )
+
+            if parsed:
+                return parsed
+
+        return None
+
+    # ========================================================================
+    # FILTER STRUCTURE HELPERS
+    # ========================================================================
+
+    def _contains_where(
+        self,
+        value,
+    ):
+
+        if isinstance(
+            value,
+            dict,
+        ):
+
+            if "Where" in value:
+                return True
+
+            for child in value.values():
+
+                if self._contains_where(
+                    child
+                ):
+
+                    return True
+
+        elif isinstance(
+            value,
+            list,
+        ):
+
+            for child in value:
+
+                if self._contains_where(
+                    child
+                ):
+
+                    return True
+
+        return False
+
+    def _contains_filter_expression(
+        self,
+        value,
+    ):
+        """
+        Detect an actual persisted filter expression.
+
+        We intentionally do not treat merely having a `field` as a filter.
+        """
+
+        if not isinstance(
+            value,
+            (
+                dict,
+                list,
+            ),
+        ):
+
+            return False
+
+        if self._contains_where(
+            value
+        ):
+
+            return True
+
+        if isinstance(
+            value,
+            dict,
+        ):
+
+            # Common filter-expression containers.
+            expression_keys = {
+                "condition",
+                "conditions",
+                "operator",
+                "comparison",
+                "comparisons",
+                "value",
+                "values",
+                "valuesMetadata",
+                "filter",
+                "Filter",
+                "filterExpression",
+                "expression",
+                "Expression",
+            }
+
+            for key in expression_keys:
+
+                if key not in value:
+                    continue
+
+                child = value.get(
+                    key
+                )
+
+                if isinstance(
+                    child,
+                    (
+                        dict,
+                        list,
+                    ),
+                ):
+
+                    if self._contains_filter_expression(
+                        child
+                    ):
+
+                        return True
+
+                elif child is not None:
+
+                    return True
+
+        elif isinstance(
+            value,
+            list,
+        ):
+
+            for child in value:
+
+                if self._contains_filter_expression(
+                    child
+                ):
+
+                    return True
+
+        return False
+
+    def _has_filter_target(
+        self,
+        filter_definition,
+    ):
+        """
+        Determine whether a filter has a real field/target.
+
+        IMPORTANT:
+        This method uses `self._parse_filter_field()`, not
+        `cls._parse_filter_field()`.
+        """
+
+        if not isinstance(
+            filter_definition,
+            dict,
+        ):
+
+            return False
+
+        field = filter_definition.get(
+            "field"
+        )
+
+        if isinstance(
+            field,
+            dict,
+        ):
+
+            if self._parse_filter_field(
+                field
+            ):
+
+                return True
+
+        target = filter_definition.get(
+            "target"
+        )
+
+        if isinstance(
+            target,
+            dict,
+        ):
+
+            if any(
+                target.get(key)
+                for key in (
+                    "table",
+                    "entity",
+                    "Entity",
+                    "column",
+                    "property",
+                    "Column",
+                    "measure",
+                    "Measure",
+                )
+            ):
+
+                return True
+
+        # Some definitions put the field under the filter object.
+        nested_filter = filter_definition.get(
+            "filter"
+        )
+
+        if isinstance(
+            nested_filter,
+            dict,
+        ):
+
+            nested_field = nested_filter.get(
+                "field"
+            )
+
+            if isinstance(
+                nested_field,
+                dict,
+            ):
+
+                if self._parse_filter_field(
+                    nested_field
+                ):
+
+                    return True
+
+        return False
+
+    def _is_actual_filter(
+        self,
+        filter_definition,
+    ):
+        """
+        Decide whether a filterConfig entry represents an ACTUAL filter.
+
+        This is the central distinction between:
+
+            visual field/projection
+                         VS
+            persisted filter
+
+        Rules:
+
+        A) A filter with a real filter expression is accepted.
+
+        B) TopN with a real filter payload is accepted.
+
+        C) Advanced with a real filter payload is accepted.
+
+        D) Explicit howCreated metadata plus a real target is accepted.
+
+        E) A field-only definition without filter criteria is rejected.
+        """
+
+        if not isinstance(
+            filter_definition,
+            dict,
+        ):
+
+            return False
+
+        filter_type = (
+            filter_definition.get(
+                "type"
+            )
+            or filter_definition.get(
+                "filterType"
+            )
+            or ""
+        )
+
+        filter_type_normalized = str(
+            filter_type
+        ).strip().lower()
+
+        nested_filter = filter_definition.get(
+            "filter"
+        )
+
+        how_created = filter_definition.get(
+            "howCreated"
+        )
+
+        # ---------------------------------------------------------------
+        # 1. Actual filter payload
+        # ---------------------------------------------------------------
+
+        if isinstance(
+            nested_filter,
+            (
+                dict,
+                list,
+            ),
+        ):
+
+            if self._contains_filter_expression(
+                nested_filter
+            ):
+
+                return True
+
+        # ---------------------------------------------------------------
+        # 2. Filter expression elsewhere in definition
+        # ---------------------------------------------------------------
+
+        if self._contains_filter_expression(
+            filter_definition
+        ):
+
+            # Make sure this is not simply a visual field definition.
+            if (
+                self._has_filter_target(
+                    filter_definition
+                )
+                or filter_type_normalized in {
+                    "topn",
+                    "advanced",
+                    "categorical",
+                    "relativeDate".lower(),
+                    "relativedate",
+                    "relativetime",
+                    "include",
+                    "exclude",
+                    "range",
+                }
+            ):
+
+                return True
+
+        # ---------------------------------------------------------------
+        # 3. TopN
+        #
+        # TopN is always a genuine filter when its definition contains
+        # an actual filter payload.
+        # ---------------------------------------------------------------
+
+        if filter_type_normalized == "topn":
+
+            if isinstance(
+                nested_filter,
+                (
+                    dict,
+                    list,
+                ),
+            ):
+
+                return True
+
+            if how_created:
+
+                return self._has_filter_target(
+                    filter_definition
+                )
+
+        # ---------------------------------------------------------------
+        # 4. Advanced
+        # ---------------------------------------------------------------
+
+        if filter_type_normalized == "advanced":
+
+            if isinstance(
+                nested_filter,
+                (
+                    dict,
+                    list,
+                ),
+            ):
+
+                return True
+
+            if how_created:
+
+                return self._has_filter_target(
+                    filter_definition
+                )
+
+        # ---------------------------------------------------------------
+        # 5. Explicit creation metadata
+        #
+        # Only accept this if the object ALSO has a real target.
+        # This prevents a bare visual field from becoming a filter.
+        # ---------------------------------------------------------------
+
+        if how_created is not None:
+
+            how_created_normalized = str(
+                how_created
+            ).strip().lower()
+
+            meaningful_creation_values = {
+                "user",
+                "include",
+                "exclude",
+                "drillthrough",
+                "copilot",
+                "generated",
+                "explicit",
+            }
+
+            if (
+                how_created_normalized
+                in meaningful_creation_values
+                and self._has_filter_target(
+                    filter_definition
+                )
+            ):
+
+                # If it has a filter payload, definitely accept.
+                if isinstance(
+                    nested_filter,
+                    (
+                        dict,
+                        list,
+                    ),
+                ):
+
+                    return True
+
+                # If there is no payload, only accept for explicit
+                # filter types where the metadata itself is sufficient.
+                if filter_type_normalized in {
+                    "include",
+                    "exclude",
+                    "topn",
+                    "advanced",
+                    "relativedate",
+                    "relativetime",
+                    "range",
+                }:
+
+                    return True
+
+        # ---------------------------------------------------------------
+        # 6. Otherwise this is most likely an automatic field/projection
+        #    entry and must NOT be stored as a filter.
+        # ---------------------------------------------------------------
+
+        return False
+
+    # ========================================================================
+    # FILTER FIELD EXTRACTION
+    # ========================================================================
+
+    def _extract_filter_field_metadata(
+        self,
+        filter_definition,
+    ):
+
+        field_candidates = []
+
+        field = filter_definition.get(
+            "field"
+        )
+
+        if isinstance(
+            field,
+            dict,
+        ):
+
+            field_candidates.append(
+                field
+            )
+
+        target = filter_definition.get(
+            "target"
+        )
+
+        if isinstance(
+            target,
+            dict,
+        ):
+
+            field_candidates.append(
+                target
+            )
+
+        nested_filter = filter_definition.get(
+            "filter"
+        )
+
+        expression = filter_definition.get(
+            "expression"
+        )
+
+        if isinstance(
+            expression,
+            dict,
+        ):
+
+            field_candidates.append(
+                expression
+            )
+
+        if isinstance(
+            nested_filter,
+            dict,
+        ):
+
+            nested_field = nested_filter.get(
+                "field"
+            )
+
+            if isinstance(
+                nested_field,
+                dict,
+            ):
+
+                field_candidates.append(
+                    nested_field
+                )
+
+        for candidate in field_candidates:
+
+            metadata = self._parse_filter_field(
+                candidate
+            )
+
+            if metadata:
+                return metadata
+
+        # ---------------------------------------------------------------
+        # Legacy target fallback
+        # ---------------------------------------------------------------
+
+        target = filter_definition.get(
+            "target",
+            {}
+        )
+
+        if not isinstance(
+            target,
+            dict,
+        ):
+
+            target = {}
+
+        table_name = (
+            target.get("table")
+            or target.get("entity")
+            or target.get("Entity")
+        )
+
+        column_name = (
+            target.get("column")
+            or target.get("property")
+            or target.get("Column")
+        )
+
+        measure_name = (
+            target.get("measure")
+            or target.get("Measure")
+        )
+
+        if measure_name:
+
+            return {
+                "field_type": "Measure",
+                "table_name": table_name,
+                "column_name": None,
+                "measure_name": measure_name,
+                "aggregation_function": None,
+            }
+
+        if column_name:
+
+            return {
+                "field_type": "Column",
+                "table_name": table_name,
+                "column_name": column_name,
+                "measure_name": None,
+                "aggregation_function": None,
+            }
+
+        return None
+
+    # ========================================================================
+    # PBIR VISUAL FILTERS
+    # ========================================================================
+
+
+    def _extract_pbir_visual_filters(
+        self,
+        visual,
+    ):
+
         result = []
-        raw = visual.get("raw", {})
-        filter_config = raw.get("filterConfig", {})
 
-        if not isinstance(filter_config, dict):
+        raw = visual.get(
+            "raw",
+            {}
+        )
+
+        filter_config = raw.get(
+            "filterConfig",
+            {}
+        )
+
+        if not isinstance(
+            filter_config,
+            dict,
+        ):
+
             return result
 
-        filters = filter_config.get("filters", [])
-        if not isinstance(filters, list):
+        filters = filter_config.get(
+            "filters",
+            []
+        )
+
+        if not isinstance(
+            filters,
+            list,
+        ):
+
             return result
 
         for filter_definition in filters:
-            if not isinstance(filter_definition, dict):
+
+            if not isinstance(
+                filter_definition,
+                dict,
+            ):
+
                 continue
 
-            field_metadata = self._parse_field(
-                filter_definition.get("field", {})
+            if not self._is_actual_filter(
+                filter_definition
+            ):
+
+                continue
+
+            field_metadata = (
+                self._extract_filter_field_metadata(
+                    filter_definition
+                )
             )
 
             result.append(
                 {
-                    "filter_name": filter_definition.get("name"),
+                    "filter_name": (
+                        filter_definition.get(
+                            "name"
+                        )
+                    ),
                     "field_type": (
-                        field_metadata.get("field_type")
-                        if field_metadata else None
+                        field_metadata.get(
+                            "field_type"
+                        )
+                        if field_metadata
+                        else None
                     ),
                     "table_name": (
-                        field_metadata.get("table_name")
-                        if field_metadata else None
+                        field_metadata.get(
+                            "table_name"
+                        )
+                        if field_metadata
+                        else None
                     ),
                     "column_name": (
-                        field_metadata.get("column_name")
-                        if field_metadata else None
+                        field_metadata.get(
+                            "column_name"
+                        )
+                        if field_metadata
+                        else None
                     ),
                     "measure_name": (
-                        field_metadata.get("measure_name")
-                        if field_metadata else None
+                        field_metadata.get(
+                            "measure_name"
+                        )
+                        if field_metadata
+                        else None
                     ),
-                    "filter_type": filter_definition.get("type"),
+                    "filter_type": (
+                        filter_definition.get(
+                            "type"
+                        )
+                        or filter_definition.get(
+                            "filterType"
+                        )
+                    ),
                 }
             )
 
         return result
 
-    def _extract_legacy_visual_filters(self, visual):
+
+
+    # ========================================================================
+    # LEGACY VISUAL FILTERS
+    # ========================================================================
+
+    def _extract_legacy_visual_filters(
+        self,
+        visual,
+    ):
+
         result = []
-        raw = visual.get("raw", {})
-        filters = raw.get("legacyFilters", [])
 
-        if isinstance(filters, dict):
-            filters = [filters]
+        raw = visual.get(
+            "raw",
+            {}
+        )
 
-        if not isinstance(filters, list):
+        filters = raw.get(
+            "legacyFilters",
+            []
+        )
+
+        if isinstance(
+            filters,
+            dict,
+        ):
+
+            filters = [
+                filters
+            ]
+
+        if not isinstance(
+            filters,
+            list,
+        ):
+
             return result
 
-        for index, filter_definition in enumerate(filters, start=1):
-            if not isinstance(filter_definition, dict):
+        for index, filter_definition in enumerate(
+            filters,
+            start=1,
+        ):
+
+            if not isinstance(
+                filter_definition,
+                dict,
+            ):
+
                 continue
 
-            target = filter_definition.get("target", {})
-            if not isinstance(target, dict):
+            if not self._is_actual_filter(
+                filter_definition
+            ):
+
+                target = filter_definition.get(
+                    "target",
+                    {},
+                )
+
+                if not isinstance(
+                    target,
+                    dict,
+                ):
+
+                    target = {}
+
+                has_target = any(
+                    target.get(key)
+                    for key in (
+                        "table",
+                        "entity",
+                        "Entity",
+                        "column",
+                        "property",
+                        "Column",
+                        "measure",
+                        "Measure",
+                    )
+                )
+
+                has_value = any(
+                    filter_definition.get(key) is not None
+                    for key in (
+                        "value",
+                        "values",
+                        "conditions",
+                        "condition",
+                    )
+                )
+
+                if not (
+                    has_target
+                    and has_value
+                ):
+
+                    continue
+
+            target = filter_definition.get(
+                "target",
+                {}
+            )
+
+            if not isinstance(
+                target,
+                dict,
+            ):
+
                 target = {}
 
             table_name = (
@@ -2214,27 +4525,56 @@ class ReportMetadataExtractor:
                 or target.get("Measure")
             )
 
-            field_metadata = self._parse_field(
-                filter_definition.get("field", {})
+            field_metadata = (
+                self._extract_filter_field_metadata(
+                    filter_definition
+                )
             )
 
             if field_metadata:
-                table_name = table_name or field_metadata.get("table_name")
-                column_name = column_name or field_metadata.get("column_name")
-                measure_name = measure_name or field_metadata.get("measure_name")
+
+                table_name = (
+                    table_name
+                    or field_metadata.get(
+                        "table_name"
+                    )
+                )
+
+                column_name = (
+                    column_name
+                    or field_metadata.get(
+                        "column_name"
+                    )
+                )
+
+                measure_name = (
+                    measure_name
+                    or field_metadata.get(
+                        "measure_name"
+                    )
+                )
 
             if measure_name:
+
                 field_type = "Measure"
+
             elif column_name:
+
                 field_type = "Column"
+
             else:
+
                 field_type = None
 
             result.append(
                 {
                     "filter_name": (
-                        filter_definition.get("name")
-                        or filter_definition.get("displayName")
+                        filter_definition.get(
+                            "name"
+                        )
+                        or filter_definition.get(
+                            "displayName"
+                        )
                         or f"LegacyFilter_{index}"
                     ),
                     "field_type": field_type,
@@ -2242,14 +4582,21 @@ class ReportMetadataExtractor:
                     "column_name": column_name,
                     "measure_name": measure_name,
                     "filter_type": (
-                        filter_definition.get("type")
-                        or filter_definition.get("filterType")
-                        or filter_definition.get("condition")
+                        filter_definition.get(
+                            "type"
+                        )
+                        or filter_definition.get(
+                            "filterType"
+                        )
+                        or filter_definition.get(
+                            "condition"
+                        )
                     ),
                 }
             )
 
         return result
+
 
 # ============================================================================
 # LOOKUPS
@@ -2258,6 +4605,7 @@ class ReportMetadataExtractor:
 def build_semantic_table_lookup(
     cursor,
 ):
+
     cursor.execute(
         """
         SELECT
@@ -2285,6 +4633,7 @@ def build_semantic_table_lookup(
 def build_semantic_column_lookup(
     cursor,
 ):
+
     cursor.execute(
         """
         SELECT
@@ -2317,6 +4666,7 @@ def build_semantic_column_lookup(
 def build_measure_lookup(
     cursor,
 ):
+
     cursor.execute(
         """
         SELECT
@@ -2353,6 +4703,7 @@ def get_or_create_report(
     workspace_id,
     workspace_name,
 ):
+
     cursor.execute(
         """
         SELECT ReportID
@@ -2389,8 +4740,6 @@ def get_or_create_report(
             repository_report_id,
         )
 
-        cursor.connection.commit()
-
         logger.info(
             "Updated MetadataReport %s for workspace %s",
             repository_report_id,
@@ -2420,8 +4769,6 @@ def get_or_create_report(
         "Microsoft Fabric Report",
     )
 
-    cursor.connection.commit()
-
     cursor.execute(
         """
         SELECT ReportID
@@ -2434,11 +4781,14 @@ def get_or_create_report(
     result = cursor.fetchone()
 
     if not result:
+
         raise RuntimeError(
             "Could not retrieve ReportID after insert."
         )
 
-    return int(result[0])
+    return int(
+        result[0]
+    )
 
 
 # ============================================================================
@@ -2507,8 +4857,6 @@ def clear_report_children(
         report_id,
     )
 
-    cursor.connection.commit()
-
 
 # ============================================================================
 # CLEAR REPORT LINEAGE
@@ -2518,23 +4866,6 @@ def clear_report_lineage(
     cursor,
     report_id,
 ):
-    """
-    Remove lineage records generated from this report.
-
-    We remove report-related lineage through the entity relationships:
-
-        REPORT -> SEMANTIC_MODEL
-        REPORT -> PAGE
-        PAGE   -> VISUAL
-        VISUAL -> SEMANTIC_COLUMN
-        VISUAL -> MEASURE
-
-    The semantic dependency lineage is NOT touched.
-    """
-
-    # ------------------------------------------------------------------------
-    # 1. REPORT -> SEMANTIC MODEL
-    # ------------------------------------------------------------------------
 
     cursor.execute(
         """
@@ -2544,10 +4875,6 @@ def clear_report_lineage(
         """,
         report_id,
     )
-
-    # ------------------------------------------------------------------------
-    # 2. REPORT -> PAGE
-    # ------------------------------------------------------------------------
 
     cursor.execute(
         """
@@ -2559,59 +4886,107 @@ def clear_report_lineage(
         report_id,
     )
 
-    # ------------------------------------------------------------------------
-    # 3. PAGE -> VISUAL
-    # ------------------------------------------------------------------------
-
     cursor.execute(
         """
         DELETE FROM dbo.MetadataLineage
         WHERE FromEntityType = 'PAGE'
           AND ToEntityType = 'VISUAL'
           AND FromEntityID IN
-          (
-              SELECT PageID
-              FROM dbo.MetadataReportPage
-              WHERE ReportID = ?
-          )
+        (
+            SELECT PageID
+            FROM dbo.MetadataReportPage
+            WHERE ReportID = ?
+        )
         """,
         report_id,
     )
-
-    # ------------------------------------------------------------------------
-    # 4. VISUAL -> SEMANTIC COLUMN / MEASURE
-    # ------------------------------------------------------------------------
 
     cursor.execute(
         """
         DELETE FROM dbo.MetadataLineage
         WHERE FromEntityType = 'VISUAL'
           AND ToEntityType IN
-          (
-              'SEMANTIC_COLUMN',
-              'MEASURE'
-          )
+        (
+            'SEMANTIC_COLUMN',
+            'MEASURE'
+        )
           AND FromEntityID IN
-          (
-              SELECT VisualID
-              FROM dbo.MetadataReportVisual
-              WHERE PageID IN
-              (
-                  SELECT PageID
-                  FROM dbo.MetadataReportPage
-                  WHERE ReportID = ?
-              )
-          )
+        (
+            SELECT VisualID
+            FROM dbo.MetadataReportVisual
+            WHERE PageID IN
+            (
+                SELECT PageID
+                FROM dbo.MetadataReportPage
+                WHERE ReportID = ?
+            )
+        )
         """,
         report_id,
     )
-
-    cursor.connection.commit()
 
     logger.info(
         "Cleared report lineage for ReportID=%s",
         report_id,
     )
+
+
+def reconcile_deleted_reports(
+    cursor,
+    workspace_id,
+    discovered_report_ids,
+):
+
+    cursor.execute(
+        """
+        SELECT ReportID, FabricReportID
+        FROM dbo.MetadataReport
+        WHERE WorkspaceID = ?
+        """,
+        workspace_id,
+    )
+
+    discovered_ids = {
+        str(report_id).lower()
+        for report_id in discovered_report_ids
+    }
+
+    deleted_count = 0
+
+    existing_reports = cursor.fetchall()
+
+    for repository_report_id, fabric_report_id in existing_reports:
+
+        if str(fabric_report_id).lower() in discovered_ids:
+            continue
+
+        clear_report_lineage(
+            cursor,
+            int(repository_report_id),
+        )
+
+        clear_report_children(
+            cursor,
+            int(repository_report_id),
+        )
+
+        cursor.execute(
+            """
+            DELETE FROM dbo.MetadataReport
+            WHERE ReportID = ?
+            """,
+            int(repository_report_id),
+        )
+
+        deleted_count += 1
+
+        logger.info(
+            "Removed deleted Fabric report %s from workspace %s.",
+            fabric_report_id,
+            workspace_id,
+        )
+
+    return deleted_count
 
 
 # ============================================================================
@@ -2624,52 +4999,45 @@ def load_pages(
     pages,
 ):
 
-    lookup = {}
+    if not pages:
+        return {}
 
-    for page in pages:
-
-        cursor.execute(
-            """
-            INSERT INTO dbo.MetadataReportPage
+    execute_insert_batches(
+        cursor,
+        """
+        INSERT INTO dbo.MetadataReportPage
+        (
+            ReportID,
+            PageName,
+            DisplayName,
+            PageOrder
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        [
             (
-                ReportID,
-                PageName,
-                DisplayName,
-                PageOrder
+                report_id,
+                page["page_name"],
+                page["display_name"],
+                page["page_order"],
             )
-            VALUES (?, ?, ?, ?)
-            """,
-            report_id,
-            page["page_name"],
-            page["display_name"],
-            page["page_order"],
-        )
+            for page in pages
+        ],
+    )
 
-        cursor.execute(
-            """
-            SELECT PageID
-            FROM dbo.MetadataReportPage
-            WHERE ReportID = ?
-              AND PageName = ?
-            """,
-            report_id,
-            page["page_name"],
-        )
+    cursor.execute(
+        """
+        SELECT PageID, PageName
+        FROM dbo.MetadataReportPage
+        WHERE ReportID = ?
+        """,
+        report_id,
+    )
 
-        result = cursor.fetchone()
-
-        if not result:
-
-            raise RuntimeError(
-                f"Could not retrieve PageID for "
-                f"{page['page_name']}"
-            )
-
-        lookup[
-            page["page_name"]
-        ] = int(result[0])
-
-    cursor.connection.commit()
+    lookup = {
+        str(page_name): int(page_id)
+        for page_id, page_name in cursor.fetchall()
+    }
 
     return lookup
 
@@ -2680,11 +5048,15 @@ def load_pages(
 
 def load_visuals(
     cursor,
+    report_id,
     page_lookup,
     visuals,
 ):
 
-    lookup = {}
+    if not visuals:
+        return {}
+
+    rows = []
 
     for visual in visuals:
 
@@ -2701,44 +5073,48 @@ def load_visuals(
 
             continue
 
-        cursor.execute(
-            """
-            INSERT INTO dbo.MetadataReportVisual
+        rows.append(
             (
-                PageID,
-                FabricVisualID,
-                VisualType
+                page_id,
+                visual["fabric_visual_id"],
+                visual["visual_type"],
             )
-            VALUES (?, ?, ?)
-            """,
-            page_id,
-            visual["fabric_visual_id"],
-            visual["visual_type"],
         )
 
-        cursor.execute(
-            """
-            SELECT VisualID
-            FROM dbo.MetadataReportVisual
-            WHERE PageID = ?
-              AND FabricVisualID = ?
-            """,
-            page_id,
-            visual["fabric_visual_id"],
+    if not rows:
+        return {}
+
+    execute_insert_batches(
+        cursor,
+        """
+        INSERT INTO dbo.MetadataReportVisual
+        (
+            PageID,
+            FabricVisualID,
+            VisualType
         )
+        VALUES (?, ?, ?)
+        """,
+        rows,
+    )
 
-        result = cursor.fetchone()
+    cursor.execute(
+        """
+        SELECT
+            v.VisualID,
+            v.FabricVisualID
+        FROM dbo.MetadataReportVisual v
+        INNER JOIN dbo.MetadataReportPage p
+            ON v.PageID = p.PageID
+        WHERE p.ReportID = ?
+        """,
+        report_id,
+    )
 
-        if not result:
-            raise RuntimeError(
-                "Could not retrieve VisualID."
-            )
-
-        lookup[
-            visual["fabric_visual_id"]
-        ] = int(result[0])
-
-    cursor.connection.commit()
+    lookup = {
+        str(fabric_visual_id): int(visual_id)
+        for visual_id, fabric_visual_id in cursor.fetchall()
+    }
 
     return lookup
 
@@ -2746,6 +5122,80 @@ def load_visuals(
 # ============================================================================
 # FIELD ID RESOLUTION
 # ============================================================================
+
+def resolve_semantic_table_name(
+    semantic_model_id,
+    table_name,
+    semantic_table_lookup,
+):
+    """
+    Resolve a PBIR table/entity name to the canonical semantic-model
+    table name.
+
+    Resolution order:
+        1. Exact table-name match.
+        2. PBIR dimension alias (dim_X -> X), but only when the
+           candidate table actually exists in the current semantic model.
+
+    Returns:
+        Canonical semantic table name, or None if unresolved.
+    """
+
+    if not table_name:
+        return None
+
+    table_name = str(
+        table_name
+    ).strip()
+
+    if not table_name:
+        return None
+
+    # ------------------------------------------------------------------
+    # 1. Exact semantic-model table name
+    # ------------------------------------------------------------------
+
+    if (
+        semantic_model_id,
+        table_name,
+    ) in semantic_table_lookup:
+
+        return table_name
+
+    # ------------------------------------------------------------------
+    # 2. PBIR dimension alias
+    #
+    # Example:
+    #     PBIR:     dim_Date
+    #     Semantic: Date
+    #
+    # Only accept the transformation if the candidate table actually
+    # exists in this semantic model.
+    # ------------------------------------------------------------------
+
+    if table_name.lower().startswith(
+        "dim_"
+    ):
+
+        candidate_table_name = table_name[
+            4:
+        ].strip()
+
+        if candidate_table_name:
+
+            if (
+                semantic_model_id,
+                candidate_table_name,
+            ) in semantic_table_lookup:
+
+                return candidate_table_name
+
+    # ------------------------------------------------------------------
+    # 3. No safe resolution
+    # ------------------------------------------------------------------
+
+    return None
+
 
 def resolve_field_ids(
     field,
@@ -2771,28 +5221,61 @@ def resolve_field_ids(
     semantic_column_id = None
     measure_id = None
 
-    if table_name:
+    # ------------------------------------------------------------------
+    # Resolve table name
+    # ------------------------------------------------------------------
+
+    resolved_table_name = (
+        resolve_semantic_table_name(
+            semantic_model_id,
+            table_name,
+            semantic_table_lookup,
+        )
+    )
+
+    if resolved_table_name:
 
         semantic_table_id = (
             semantic_table_lookup.get(
                 (
                     semantic_model_id,
-                    str(table_name),
+                    resolved_table_name,
                 )
             )
         )
 
-    if table_name and column_name:
+    # ------------------------------------------------------------------
+    # Resolve column using the RESOLVED semantic table name.
+    #
+    # This is important:
+    #
+    #     PBIR: dim_Date[Date]
+    #
+    # becomes:
+    #
+    #     Semantic: Date[Date]
+    #
+    # We never search for a column globally by column name.
+    # ------------------------------------------------------------------
+
+    if (
+        resolved_table_name
+        and column_name
+    ):
 
         semantic_column_id = (
             semantic_column_lookup.get(
                 (
                     semantic_model_id,
-                    str(table_name),
+                    resolved_table_name,
                     str(column_name),
                 )
             )
         )
+
+    # ------------------------------------------------------------------
+    # Resolve measure
+    # ------------------------------------------------------------------
 
     if measure_name:
 
@@ -2826,7 +5309,7 @@ def load_visual_fields(
     measure_lookup,
 ):
 
-    inserted = 0
+    rows = []
     unresolved = 0
 
     for visual in visuals:
@@ -2892,44 +5375,41 @@ def load_visual_fields(
                     field.get("measure_name"),
                 )
 
-            cursor.execute(
-                """
-                INSERT INTO dbo.MetadataReportVisualField
+            rows.append(
                 (
-                    VisualID,
-                    FieldType,
-                    SemanticTableID,
-                    SemanticColumnID,
-                    MeasureID,
-                    AggregationFunction,
-                    ProjectionArea,
-                    QueryRef,
-                    NativeQueryRef
+                    visual_id,
+                    field.get("field_type"),
+                    semantic_table_id,
+                    semantic_column_id,
+                    measure_id,
+                    field.get("aggregation_function"),
+                    field.get("projection_area"),
+                    field.get("query_ref"),
+                    field.get("native_query_ref"),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                visual_id,
-                field.get("field_type"),
-                semantic_table_id,
-                semantic_column_id,
-                measure_id,
-                field.get(
-                    "aggregation_function"
-                ),
-                field.get(
-                    "projection_area"
-                ),
-                field.get(
-                    "query_ref"
-                ),
-                field.get(
-                    "native_query_ref"
-                ),
             )
 
-            inserted += 1
+    if rows:
 
-    cursor.connection.commit()
+        execute_insert_batches(
+            cursor,
+            """
+            INSERT INTO dbo.MetadataReportVisualField
+            (
+                VisualID,
+                FieldType,
+                SemanticTableID,
+                SemanticColumnID,
+                MeasureID,
+                AggregationFunction,
+                ProjectionArea,
+                QueryRef,
+                NativeQueryRef
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
 
     if unresolved:
 
@@ -2938,7 +5418,7 @@ def load_visual_fields(
             unresolved,
         )
 
-    return inserted
+    return len(rows)
 
 
 # ============================================================================
@@ -2955,9 +5435,8 @@ def load_visual_filters(
     measure_lookup,
 ):
 
-    inserted = 0
+    rows = []
     unresolved = 0
-
     for visual in visuals:
 
         visual_id = visual_lookup.get(
@@ -2988,52 +5467,60 @@ def load_visual_filters(
                 filter_definition.get("table_name")
                 and semantic_table_id is None
             ):
+
                 unresolved += 1
 
             if (
                 filter_definition.get("column_name")
                 and semantic_column_id is None
             ):
+
                 unresolved += 1
 
             if (
                 filter_definition.get("measure_name")
                 and measure_id is None
             ):
+
                 unresolved += 1
 
-            cursor.execute(
-                """
-                INSERT INTO dbo.MetadataReportVisualFilter
+            rows.append(
                 (
-                    VisualID,
-                    FilterName,
-                    FieldType,
-                    SemanticTableID,
-                    SemanticColumnID,
-                    MeasureID,
-                    FilterType
+                    visual_id,
+                    filter_definition.get(
+                        "filter_name"
+                    ),
+                    filter_definition.get(
+                        "field_type"
+                    ),
+                    semantic_table_id,
+                    semantic_column_id,
+                    measure_id,
+                    filter_definition.get(
+                        "filter_type"
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                visual_id,
-                filter_definition.get(
-                    "filter_name"
-                ),
-                filter_definition.get(
-                    "field_type"
-                ),
-                semantic_table_id,
-                semantic_column_id,
-                measure_id,
-                filter_definition.get(
-                    "filter_type"
-                ),
             )
 
-            inserted += 1
+    if rows:
 
-    cursor.connection.commit()
+        execute_insert_batches(
+            cursor,
+            """
+            INSERT INTO dbo.MetadataReportVisualFilter
+            (
+                VisualID,
+                FilterName,
+                FieldType,
+                SemanticTableID,
+                SemanticColumnID,
+                MeasureID,
+                FilterType
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
 
     if unresolved:
 
@@ -3042,7 +5529,7 @@ def load_visual_filters(
             unresolved,
         )
 
-    return inserted
+    return len(rows)
 
 
 # ============================================================================
@@ -3083,52 +5570,6 @@ def enrich_visuals(
 # REPORT LINEAGE
 # ============================================================================
 
-def insert_lineage(
-    cursor,
-    from_entity_type,
-    from_entity_id,
-    to_entity_type,
-    to_entity_id,
-    lineage_type,
-    expression=None,
-    resolution_method=None,
-):
-    """
-    Insert one generic lineage relationship.
-    """
-
-    if from_entity_id is None:
-        return False
-
-    if to_entity_id is None:
-        return False
-
-    cursor.execute(
-        """
-        INSERT INTO dbo.MetadataLineage
-        (
-            FromEntityType,
-            FromEntityID,
-            ToEntityType,
-            ToEntityID,
-            LineageType,
-            Expression,
-            ResolutionMethod
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        from_entity_type,
-        int(from_entity_id),
-        to_entity_type,
-        int(to_entity_id),
-        lineage_type,
-        expression,
-        resolution_method,
-    )
-
-    return True
-
-
 def load_report_lineage(
     cursor,
     report_id,
@@ -3137,63 +5578,39 @@ def load_report_lineage(
     visual_lookup,
     visuals,
 ):
-    """
-    Build report-level lineage.
 
-    Relationships:
+    rows = []
 
-        REPORT
-          -> SEMANTIC_MODEL
+    if repository_semantic_model_id is not None:
 
-        REPORT
-          -> PAGE
-
-        PAGE
-          -> VISUAL
-
-        VISUAL
-          -> SEMANTIC_COLUMN
-
-        VISUAL
-          -> MEASURE
-    """
-
-    inserted = 0
-
-    # ========================================================================
-    # REPORT -> SEMANTIC MODEL
-    # ========================================================================
-
-    if insert_lineage(
-        cursor,
-        "REPORT",
-        report_id,
-        "SEMANTIC_MODEL",
-        repository_semantic_model_id,
-        "REPORT_TO_SEMANTIC_MODEL",
-        resolution_method="REPORT_SEMANTIC_MODEL_REFERENCE",
-    ):
-        inserted += 1
-
-    # ========================================================================
-    # REPORT -> PAGE
-    # ========================================================================
+        rows.append(
+            (
+                "REPORT",
+                int(report_id),
+                "SEMANTIC_MODEL",
+                int(repository_semantic_model_id),
+                "REPORT_TO_SEMANTIC_MODEL",
+                None,
+                "REPORT_SEMANTIC_MODEL_REFERENCE",
+            )
+        )
 
     for page_name, page_id in page_lookup.items():
 
-        if insert_lineage(
-            cursor,
-            "REPORT",
-            report_id,
-            "PAGE",
-            page_id,
-            "REPORT_TO_PAGE",
-        ):
-            inserted += 1
+        if page_id is None:
+            continue
 
-    # ========================================================================
-    # PAGE -> VISUAL
-    # ========================================================================
+        rows.append(
+            (
+                "REPORT",
+                int(report_id),
+                "PAGE",
+                int(page_id),
+                "REPORT_TO_PAGE",
+                None,
+                None,
+            )
+        )
 
     for visual in visuals:
 
@@ -3208,23 +5625,19 @@ def load_report_lineage(
         if page_id is None or visual_id is None:
             continue
 
-        if insert_lineage(
-            cursor,
-            "PAGE",
-            page_id,
-            "VISUAL",
-            visual_id,
-            "PAGE_TO_VISUAL",
-            expression=visual.get(
-                "definition_path"
-            ),
-            resolution_method="REPORT_DEFINITION",
-        ):
-            inserted += 1
-
-    # ========================================================================
-    # VISUAL -> SEMANTIC COLUMN / MEASURE
-    # ========================================================================
+        rows.append(
+            (
+                "PAGE",
+                int(page_id),
+                "VISUAL",
+                int(visual_id),
+                "PAGE_TO_VISUAL",
+                visual.get(
+                    "definition_path"
+                ),
+                "REPORT_DEFINITION",
+            )
+        )
 
     for visual in visuals:
 
@@ -3248,56 +5661,65 @@ def load_report_lineage(
                 "_resolved_measure_id"
             )
 
-            # ---------------------------------------------------------------
-            # VISUAL -> SEMANTIC COLUMN
-            # ---------------------------------------------------------------
+            expression = (
+                field.get("query_ref")
+                or field.get("native_query_ref")
+            )
 
             if semantic_column_id is not None:
 
-                if insert_lineage(
-                    cursor,
-                    "VISUAL",
-                    visual_id,
-                    "SEMANTIC_COLUMN",
-                    semantic_column_id,
-                    "VISUAL_TO_SEMANTIC_COLUMN",
-                    expression=(
-                        field.get("query_ref")
-                        or field.get("native_query_ref")
-                    ),
-                    resolution_method="REPORT_DEFINITION",
-                ):
-                    inserted += 1
-
-            # ---------------------------------------------------------------
-            # VISUAL -> MEASURE
-            # ---------------------------------------------------------------
+                rows.append(
+                    (
+                        "VISUAL",
+                        int(visual_id),
+                        "SEMANTIC_COLUMN",
+                        int(semantic_column_id),
+                        "VISUAL_TO_SEMANTIC_COLUMN",
+                        expression,
+                        "REPORT_DEFINITION",
+                    )
+                )
 
             if measure_id is not None:
 
-                if insert_lineage(
-                    cursor,
-                    "VISUAL",
-                    visual_id,
-                    "MEASURE",
-                    measure_id,
-                    "VISUAL_TO_MEASURE",
-                    expression=(
-                        field.get("query_ref")
-                        or field.get("native_query_ref")
-                    ),
-                    resolution_method="REPORT_DEFINITION",
-                ):
-                    inserted += 1
+                rows.append(
+                    (
+                        "VISUAL",
+                        int(visual_id),
+                        "MEASURE",
+                        int(measure_id),
+                        "VISUAL_TO_MEASURE",
+                        expression,
+                        "REPORT_DEFINITION",
+                    )
+                )
 
-    cursor.connection.commit()
+    if rows:
+
+        execute_insert_batches(
+            cursor,
+            """
+            INSERT INTO dbo.MetadataLineage
+            (
+                FromEntityType,
+                FromEntityID,
+                ToEntityType,
+                ToEntityID,
+                LineageType,
+                Expression,
+                ResolutionMethod
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
 
     logger.info(
         "Report lineage records inserted: %d",
-        inserted,
+        len(rows),
     )
 
-    return inserted
+    return len(rows)
 
 
 # ============================================================================
@@ -3311,13 +5733,6 @@ def resolve_report_field_references(
     semantic_column_lookup,
     measure_lookup,
 ):
-    """
-    Resolve repository IDs for extracted report fields.
-
-    The resolved IDs are temporarily stored on the in-memory
-    field dictionaries so that load_report_lineage() can use
-    the exact same resolution as MetadataReportVisualField.
-    """
 
     for visual in visuals:
 
@@ -3358,10 +5773,15 @@ def resolve_report_field_references(
 def process_report(
     client,
     cursor,
+    connection,
     report,
     workspace_id,
     workspace_name,
     workspace_items,
+    repository_models_cache,
+    semantic_table_lookup,
+    semantic_column_lookup,
+    measure_lookup,
 ):
 
     report_name = report["name"]
@@ -3420,6 +5840,7 @@ def process_report(
             definition,
             cursor,
             workspace_items,
+            repository_models_cache,
         )
     )
 
@@ -3445,27 +5866,7 @@ def process_report(
     )
 
     # ========================================================================
-    # 4. REPORT
-    # ========================================================================
-
-    repository_report_id = (
-        get_or_create_report(
-            cursor,
-            report_name,
-            report_id,
-            repository_semantic_model_id,
-            workspace_id,
-            workspace_name,
-        )
-    )
-
-    print(
-        "Repository ReportID: "
-        f"{repository_report_id}"
-    )
-
-    # ========================================================================
-    # 5. PARSE
+    # 4. PARSE
     # ========================================================================
 
     extractor = ReportMetadataExtractor(
@@ -3485,29 +5886,7 @@ def process_report(
     )
 
     # ========================================================================
-    # 6. LOOKUPS
-    # ========================================================================
-
-    semantic_table_lookup = (
-        build_semantic_table_lookup(
-            cursor
-        )
-    )
-
-    semantic_column_lookup = (
-        build_semantic_column_lookup(
-            cursor
-        )
-    )
-
-    measure_lookup = (
-        build_measure_lookup(
-            cursor
-        )
-    )
-
-    # ========================================================================
-    # 7. RESOLVE REPORT FIELD REFERENCES
+    # 5. RESOLVE REPORT FIELD REFERENCES
     # ========================================================================
 
     resolve_report_field_references(
@@ -3519,82 +5898,97 @@ def process_report(
     )
 
     # ========================================================================
-    # 8. REFRESH EXISTING REPORT METADATA
+    # 6. DATABASE TRANSACTION
     # ========================================================================
 
-    clear_report_lineage(
-        cursor,
-        repository_report_id,
-    )
+    try:
 
-    clear_report_children(
-        cursor,
-        repository_report_id,
-    )
+        repository_report_id = (
+            get_or_create_report(
+                cursor,
+                report_name,
+                report_id,
+                repository_semantic_model_id,
+                workspace_id,
+                workspace_name,
+            )
+        )
+
+        print(
+            "Repository ReportID: "
+            f"{repository_report_id}"
+        )
+
+        clear_report_lineage(
+            cursor,
+            repository_report_id,
+        )
+
+        clear_report_children(
+            cursor,
+            repository_report_id,
+        )
+
+        page_lookup = load_pages(
+            cursor,
+            repository_report_id,
+            pages,
+        )
+
+        visual_lookup = load_visuals(
+            cursor,
+            repository_report_id,
+            page_lookup,
+            visuals,
+        )
+
+        loaded_fields = load_visual_fields(
+            cursor,
+            visual_lookup,
+            visuals,
+            repository_semantic_model_id,
+            semantic_table_lookup,
+            semantic_column_lookup,
+            measure_lookup,
+        )
+
+        loaded_filters = load_visual_filters(
+            cursor,
+            visual_lookup,
+            visuals,
+            repository_semantic_model_id,
+            semantic_table_lookup,
+            semantic_column_lookup,
+            measure_lookup,
+        )
+
+        lineage_records = load_report_lineage(
+            cursor,
+            repository_report_id,
+            repository_semantic_model_id,
+            page_lookup,
+            visual_lookup,
+            visuals,
+        )
+
+        connection.commit()
+
+    except Exception:
+
+        rollback_transaction(
+            connection,
+            report_name,
+        )
+
+        logger.exception(
+            "Report transaction rolled back for '%s'.",
+            report_name,
+        )
+
+        raise
 
     # ========================================================================
-    # 9. PAGES
-    # ========================================================================
-
-    page_lookup = load_pages(
-        cursor,
-        repository_report_id,
-        pages,
-    )
-
-    # ========================================================================
-    # 10. VISUALS
-    # ========================================================================
-
-    visual_lookup = load_visuals(
-        cursor,
-        page_lookup,
-        visuals,
-    )
-
-    # ========================================================================
-    # 11. FIELDS
-    # ========================================================================
-
-    loaded_fields = load_visual_fields(
-        cursor,
-        visual_lookup,
-        visuals,
-        repository_semantic_model_id,
-        semantic_table_lookup,
-        semantic_column_lookup,
-        measure_lookup,
-    )
-
-    # ========================================================================
-    # 12. FILTERS
-    # ========================================================================
-
-    loaded_filters = load_visual_filters(
-        cursor,
-        visual_lookup,
-        visuals,
-        repository_semantic_model_id,
-        semantic_table_lookup,
-        semantic_column_lookup,
-        measure_lookup,
-    )
-
-    # ========================================================================
-    # 13. REPORT LINEAGE
-    # ========================================================================
-
-    lineage_records = load_report_lineage(
-        cursor,
-        repository_report_id,
-        repository_semantic_model_id,
-        page_lookup,
-        visual_lookup,
-        visuals,
-    )
-
-    # ========================================================================
-    # 14. SUMMARY
+    # 7. SUMMARY
     # ========================================================================
 
     print()
@@ -3695,6 +6089,7 @@ def main():
             workspaces,
             start=1,
         ):
+
             print(
                 f"  {index}. {workspace['workspace_name']} | "
                 f"{workspace['workspace_id']}"
@@ -3734,16 +6129,75 @@ def main():
             "Connected to MetadataRepository successfully."
         )
 
+        # ====================================================================
+        # SHARED LOOKUPS
+        # ====================================================================
+
+        print()
+        print(
+            "Building shared repository lookups..."
+        )
+
+        repository_models_cache = (
+            get_repository_semantic_models(
+                cursor
+            )
+        )
+
+        semantic_table_lookup = (
+            build_semantic_table_lookup(
+                cursor
+            )
+        )
+
+        semantic_column_lookup = (
+            build_semantic_column_lookup(
+                cursor
+            )
+        )
+
+        measure_lookup = (
+            build_measure_lookup(
+                cursor
+            )
+        )
+
+        print(
+            f"Cached semantic models: {len(repository_models_cache)}"
+        )
+
+        print(
+            f"Cached semantic tables: {len(semantic_table_lookup)}"
+        )
+
+        print(
+            f"Cached semantic columns: {len(semantic_column_lookup)}"
+        )
+
+        print(
+            f"Cached measures: {len(measure_lookup)}"
+        )
+
         total_reports_discovered = 0
 
         for workspace in workspaces:
-            workspace_id = workspace["workspace_id"]
-            workspace_name = workspace["workspace_name"]
+
+            workspace_id = workspace[
+                "workspace_id"
+            ]
+
+            workspace_name = workspace[
+                "workspace_name"
+            ]
 
             print()
             print("#" * 70)
-            print(f"WORKSPACE: {workspace_name}")
-            print(f"WORKSPACE ID: {workspace_id}")
+            print(
+                f"WORKSPACE: {workspace_name}"
+            )
+            print(
+                f"WORKSPACE ID: {workspace_id}"
+            )
             print("#" * 70)
 
             workspace_items = get_workspace_items(
@@ -3759,37 +6213,124 @@ def main():
                 workspace_items
             )
 
-            total_reports_discovered += len(reports)
+            if TARGET_REPORT_NAME:
 
-            print(
-                f"Reports discovered in workspace: {len(reports)}"
+                reports = [
+                    report
+                    for report in reports
+                    if report.get("name", "").strip().lower()
+                    == TARGET_REPORT_NAME.strip().lower()
+                ]
+
+                logger.info(
+                    "DEBUG MODE: Processing only report '%s' (%d report found)",
+                    TARGET_REPORT_NAME,
+                    len(reports),
+                )
+
+
+
+            total_reports_discovered += len(
+                reports
             )
 
-            if not reports:
-                continue
+            print(
+                f"Reports discovered in workspace: "
+                f"{len(reports)}"
+            )
 
             for report in reports:
+
                 try:
+
                     result = process_report(
                         client,
                         cursor,
+                        repository_connection,
                         report,
                         workspace_id,
                         workspace_name,
                         workspace_items,
+                        repository_models_cache,
+                        semantic_table_lookup,
+                        semantic_column_lookup,
+                        measure_lookup,
                     )
 
                     successful.append(
                         result
                     )
 
-                    total_pages += result["pages"]
-                    total_visuals += result["visuals"]
-                    total_fields += result["fields"]
-                    total_filters += result["filters"]
-                    total_lineage += result["lineage"]
+                    total_pages += result[
+                        "pages"
+                    ]
+
+                    total_visuals += result[
+                        "visuals"
+                    ]
+
+                    total_fields += result[
+                        "fields"
+                    ]
+
+                    total_filters += result[
+                        "filters"
+                    ]
+
+                    total_lineage += result[
+                        "lineage"
+                    ]
 
                 except Exception as exc:
+
+                    if is_connection_failure(exc):
+
+                        logger.warning(
+                            "Repository connection lost while processing "
+                            "'%s'. Reconnecting before continuing.",
+                            report["name"],
+                        )
+
+                        try:
+
+                            repository_connection.close()
+
+                        except Exception as close_error:
+
+                            logger.warning(
+                                "Could not close lost repository "
+                                "connection: %s",
+                                close_error,
+                            )
+
+                        try:
+
+                            repository_connection = (
+                                connect_to_fabric_warehouse(
+                                    DEFAULT_DRIVER,
+                                    FABRIC_SQL_SERVER,
+                                    FABRIC_SQL_DATABASE,
+                                )
+                            )
+
+                            cursor = repository_connection.cursor()
+
+                            logger.info(
+                                "Reconnected to MetadataRepository."
+                            )
+
+                        except Exception as reconnect_error:
+
+                            logger.exception(
+                                "Could not reconnect to MetadataRepository."
+                            )
+
+                            print()
+                            print(
+                                "ERROR reconnecting to MetadataRepository: "
+                                f"{reconnect_error}"
+                            )
+
                     failed.append(
                         {
                             "report": report,
@@ -3807,9 +6348,30 @@ def main():
 
                     print()
                     print(
-                        f"ERROR processing report '{report['name']}' in "
-                        f"workspace '{workspace_name}': {exc}"
+                        f"ERROR processing report "
+                        f"'{report['name']}' in "
+                        f"workspace '{workspace_name}': "
+                        f"{exc}"
                     )
+
+            deleted_reports = reconcile_deleted_reports(
+                cursor,
+                workspace_id,
+                [
+                    report["id"]
+                    for report in reports
+                ],
+            )
+
+            repository_connection.commit()
+
+            if deleted_reports:
+
+                logger.info(
+                    "Removed %d deleted reports from workspace '%s'.",
+                    deleted_reports,
+                    workspace_name,
+                )
 
         print()
         print("=" * 70)
@@ -3823,43 +6385,58 @@ def main():
         )
 
         print(
-            f"Reports discovered:    {total_reports_discovered}"
+            f"Reports discovered:    "
+            f"{total_reports_discovered}"
         )
 
         print(
-            f"Reports successful:    {len(successful)}"
+            f"Reports successful:    "
+            f"{len(successful)}"
         )
 
         print(
-            f"Reports failed:        {len(failed)}"
+            f"Reports failed:        "
+            f"{len(failed)}"
         )
 
         print(
-            f"Pages extracted:       {total_pages}"
+            f"Pages extracted:       "
+            f"{total_pages}"
         )
 
         print(
-            f"Visuals extracted:     {total_visuals}"
+            f"Visuals extracted:     "
+            f"{total_visuals}"
         )
 
         print(
-            f"Fields extracted:      {total_fields}"
+            f"Fields extracted:      "
+            f"{total_fields}"
         )
 
         print(
-            f"Filters extracted:     {total_filters}"
+            f"Filters extracted:     "
+            f"{total_filters}"
         )
 
         print(
-            f"Lineage records:       {total_lineage}"
+            f"Lineage records:       "
+            f"{total_lineage}"
         )
 
         if failed:
+
             print()
-            print("FAILED REPORTS")
-            print("-" * 70)
+            print(
+                "FAILED REPORTS"
+            )
+
+            print(
+                "-" * 70
+            )
 
             for failure in failed:
+
                 print(
                     f"- {failure['report']['name']} | "
                     f"{failure['workspace_name']} | "
@@ -3867,6 +6444,7 @@ def main():
                 )
 
         if successful:
+
             print()
             print(
                 "Metadata successfully loaded into MetadataRepository."

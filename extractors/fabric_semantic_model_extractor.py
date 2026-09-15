@@ -1743,6 +1743,13 @@ class RepositoryValidator:
             set
         )
 
+        # Cache of ColumnID keyed by (server, database, schema, table
+        # lowercased) + column name lowercased. Populated once in
+        # load_source_metadata() from the same query that already
+        # fetches column names, so _find_physical_column_id() can be
+        # a dict lookup instead of an extra round trip per column.
+        self.column_id_by_name = {}
+
         self.loaded_databases = set()
 
     # ========================================================================
@@ -1836,12 +1843,16 @@ class RepositoryValidator:
                     table_name,
             }
 
+        # Fetch ColumnID alongside ColumnName in the same query so
+        # we can cache it and avoid a per-column round trip later in
+        # _find_physical_column_id().
         self.cursor.execute(
             """
             SELECT
                 t.SchemaName,
                 t.TableName,
-                c.ColumnName
+                c.ColumnName,
+                c.ColumnID
             FROM dbo.MetadataColumn c
             INNER JOIN dbo.MetadataTable t
                 ON c.TableID = t.TableID
@@ -1854,6 +1865,7 @@ class RepositoryValidator:
             schema_name,
             table_name,
             column_name,
+            column_id,
         ) in self.cursor.fetchall():
 
             key = (
@@ -1867,6 +1879,15 @@ class RepositoryValidator:
                 key
             ].add(
                 str(column_name)
+            )
+
+            self.column_id_by_name[
+                (
+                    key,
+                    str(column_name).lower(),
+                )
+            ] = int(
+                column_id
             )
 
         self.loaded_databases.add(
@@ -1942,6 +1963,38 @@ class RepositoryValidator:
             for column in self.columns.get(
                 key,
                 set(),
+            )
+        )
+
+    # ========================================================================
+    # COLUMN ID (CACHED)
+    # ========================================================================
+
+    def find_column_id(
+        self,
+        server_name,
+        database_name,
+        schema_name,
+        table_name,
+        column_name,
+    ):
+
+        """
+        Cached ColumnID lookup. Populated entirely by
+        load_source_metadata(); performs no database round trip.
+        """
+
+        key = (
+            str(server_name).lower(),
+            str(database_name).lower(),
+            str(schema_name).lower(),
+            str(table_name).lower(),
+        )
+
+        return self.column_id_by_name.get(
+            (
+                key,
+                str(column_name).lower(),
             )
         )
 
@@ -2168,13 +2221,117 @@ class MetadataRepositoryWriter:
         )
 
     # ========================================================================
+    # RECONCILE DELETED MODELS
+    # ========================================================================
+
+    def reconcile_deleted_models(
+        self,
+        workspace_id,
+        discovered_model_ids,
+    ):
+        """Remove repository models no longer present in the workspace."""
+
+        self.cursor.execute(
+            """
+            SELECT
+                SemanticModelID,
+                FabricModelID
+            FROM dbo.MetadataSemanticModel
+            WHERE WorkspaceID = ?
+            """,
+            workspace_id,
+        )
+
+        discovered_ids = {
+            str(model_id).lower()
+            for model_id in discovered_model_ids
+        }
+
+        deleted_count = 0
+
+        for semantic_model_id, fabric_model_id in self.cursor.fetchall():
+
+            if str(fabric_model_id).lower() in discovered_ids:
+                continue
+
+            semantic_model_id = int(
+                semantic_model_id
+            )
+
+            self.clear_derived_metadata(
+                semantic_model_id
+            )
+
+            self.cursor.execute(
+                """
+                DELETE FROM dbo.MetadataMeasure
+                WHERE SemanticModelID = ?
+                """,
+                semantic_model_id,
+            )
+
+            self.cursor.execute(
+                """
+                DELETE C
+                FROM dbo.MetadataSemanticColumn C
+                INNER JOIN dbo.MetadataSemanticTable T
+                    ON C.SemanticTableID = T.SemanticTableID
+                WHERE T.SemanticModelID = ?
+                """,
+                semantic_model_id,
+            )
+
+            self.cursor.execute(
+                """
+                DELETE FROM dbo.MetadataSemanticTable
+                WHERE SemanticModelID = ?
+                """,
+                semantic_model_id,
+            )
+
+            self.cursor.execute(
+                """
+                DELETE FROM dbo.MetadataSemanticModel
+                WHERE SemanticModelID = ?
+                """,
+                semantic_model_id,
+            )
+
+            deleted_count += 1
+
+            logging.info(
+                "Removed deleted Fabric semantic model %s from workspace %s.",
+                fabric_model_id,
+                workspace_id,
+            )
+
+        return deleted_count
+
+    # ========================================================================
     # CLEAR MODEL CHILDREN
     # ========================================================================
 
-    def clear_model_metadata(
+    def clear_derived_metadata(
         self,
         semantic_model_id,
     ):
+        """
+        Clears only the DERIVED metadata for a model: relationships,
+        dependencies, and source mappings.
+
+        Deliberately does NOT touch MetadataSemanticTable,
+        MetadataSemanticColumn, or MetadataMeasure. Those are
+        identity-bearing rows now maintained incrementally by
+        sync_tables() / sync_columns() / sync_measures() so that
+        unchanged models require near-zero writes on repeat runs,
+        instead of a full delete-and-reinsert every time.
+
+        Derived data (relationships, dependencies, source mappings)
+        is still fully recomputed every run because it's cheap
+        (already batched) and there is no benefit to diffing it --
+        it's entirely re-derived from the current tables/columns/
+        measures each time regardless.
+        """
 
         self.cursor.execute(
             """
@@ -2191,14 +2348,6 @@ class MetadataRepositoryWriter:
             INNER JOIN dbo.MetadataMeasure M
                 ON D.MeasureID = M.MeasureID
             WHERE M.SemanticModelID = ?
-            """,
-            semantic_model_id,
-        )
-
-        self.cursor.execute(
-            """
-            DELETE FROM dbo.MetadataMeasure
-            WHERE SemanticModelID = ?
             """,
             semantic_model_id,
         )
@@ -2256,41 +2405,160 @@ class MetadataRepositoryWriter:
             semantic_model_id,
         )
 
-        self.cursor.execute(
-            """
-            DELETE C
-            FROM dbo.MetadataSemanticColumn C
-            INNER JOIN dbo.MetadataSemanticTable T
-                ON C.SemanticTableID =
-                   T.SemanticTableID
-            WHERE T.SemanticModelID = ?
-            """,
-            semantic_model_id,
+    # ========================================================================
+    # DELETE ORPHANED CHILDREN (for tables removed by sync_tables)
+    # ========================================================================
+
+    def _delete_children_of_tables(
+        self,
+        table_ids,
+    ):
+        """
+        Deletes columns and measures belonging to tables that
+        sync_tables() has determined no longer exist in the current
+        extraction, before the table rows themselves are deleted.
+        """
+
+        if not table_ids:
+            return
+
+        placeholders = ",".join(
+            "?" for _ in table_ids
         )
 
         self.cursor.execute(
-            """
-            DELETE FROM dbo.MetadataSemanticTable
-            WHERE SemanticModelID = ?
+            f"""
+            DELETE FROM dbo.MetadataSemanticColumn
+            WHERE SemanticTableID IN ({placeholders})
             """,
-            semantic_model_id,
+            *table_ids,
+        )
+
+        self.cursor.execute(
+            f"""
+            DELETE FROM dbo.MetadataMeasure
+            WHERE SemanticTableID IN ({placeholders})
+            """,
+            *table_ids,
         )
 
     # ========================================================================
-    # INSERT TABLES
+    # SYNC TABLES (incremental: insert new, update changed, delete removed)
     # ========================================================================
 
-    def insert_tables(
+    def sync_tables(
         self,
         semantic_model_id,
         tables,
     ):
 
-        table_ids = {}
+        self.cursor.execute(
+            """
+            SELECT
+                SemanticTableID,
+                TableName,
+                TableType,
+                DefinitionPath,
+                IsHidden
+            FROM dbo.MetadataSemanticTable
+            WHERE SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
 
-        for table in tables:
+        existing = {}
+
+        for (
+            table_id,
+            table_name,
+            table_type,
+            definition_path,
+            is_hidden,
+        ) in self.cursor.fetchall():
+
+            existing[str(table_name).lower()] = (
+                int(table_id),
+                table_type,
+                definition_path,
+                is_hidden,
+            )
+
+        incoming = {
+            table["table_name"].lower(): table
+            for table in tables
+        }
+
+        insert_rows = [
+            table
+            for key, table in incoming.items()
+            if key not in existing
+        ]
+
+        update_rows = [
+            (table, existing[key][0])
+            for key, table in incoming.items()
+            if key in existing
+            and (
+                existing[key][1] != table["table_type"]
+                or existing[key][2] != table["definition_path"]
+                or existing[key][3] != table["is_hidden"]
+            )
+        ]
+
+        removed_ids = [
+            row[0]
+            for key, row in existing.items()
+            if key not in incoming
+        ]
+
+        # Remove orphaned children first, then the table rows.
+        if removed_ids:
+
+            self._delete_children_of_tables(
+                removed_ids
+            )
+
+            placeholders = ",".join(
+                "?" for _ in removed_ids
+            )
 
             self.cursor.execute(
+                f"""
+                DELETE FROM dbo.MetadataSemanticTable
+                WHERE SemanticTableID IN ({placeholders})
+                """,
+                *removed_ids,
+            )
+
+        if update_rows:
+
+            self.cursor.fast_executemany = True
+
+            self.cursor.executemany(
+                """
+                UPDATE dbo.MetadataSemanticTable
+                SET
+                    TableType = ?,
+                    DefinitionPath = ?,
+                    IsHidden = ?
+                WHERE SemanticTableID = ?
+                """,
+                [
+                    (
+                        table["table_type"],
+                        table["definition_path"],
+                        table["is_hidden"],
+                        table_id,
+                    )
+                    for table, table_id in update_rows
+                ],
+            )
+
+        if insert_rows:
+
+            self.cursor.fast_executemany = True
+
+            self.cursor.executemany(
                 """
                 INSERT INTO dbo.MetadataSemanticTable
                 (
@@ -2305,82 +2573,184 @@ class MetadataRepositoryWriter:
                     ?, ?, ?, ?, ?
                 )
                 """,
-                semantic_model_id,
-                table[
-                    "table_name"
-                ],
-                table[
-                    "table_type"
-                ],
-                table[
-                    "definition_path"
-                ],
-                table[
-                    "is_hidden"
+                [
+                    (
+                        semantic_model_id,
+                        table["table_name"],
+                        table["table_type"],
+                        table["definition_path"],
+                        table["is_hidden"],
+                    )
+                    for table in insert_rows
                 ],
             )
 
-            self.cursor.execute(
-                """
-                SELECT
-                    SemanticTableID
-                FROM dbo.MetadataSemanticTable
-                WHERE SemanticModelID = ?
-                  AND TableName = ?
-                """,
-                semantic_model_id,
-                table[
-                    "table_name"
-                ],
-            )
+        # Single authoritative re-fetch of the current table ID map,
+        # correct regardless of which combination of insert/update/
+        # delete happened above.
+        self.cursor.execute(
+            """
+            SELECT
+                SemanticTableID,
+                TableName
+            FROM dbo.MetadataSemanticTable
+            WHERE SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
 
-            row = self.cursor.fetchone()
-
-            if not row:
-
-                raise RuntimeError(
-                    "Could not retrieve SemanticTableID for "
-                    f"{table['table_name']}"
-                )
-
-            table_ids[
-                table[
-                    "table_name"
-                ].lower()
-            ] = int(
-                row[0]
-            )
+        table_ids = {
+            str(table_name).lower(): int(table_id)
+            for table_id, table_name in self.cursor.fetchall()
+        }
 
         return table_ids
 
     # ========================================================================
-    # INSERT COLUMNS
+    # SYNC COLUMNS (incremental: insert new, update changed, delete removed)
     # ========================================================================
 
-    def insert_columns(
+    def sync_columns(
         self,
         table_ids,
         columns,
     ):
 
-        column_ids = {}
+        if not table_ids:
+            return {}
+
+        table_id_list = sorted(
+            set(
+                table_ids.values()
+            )
+        )
+
+        placeholders = ",".join(
+            "?" for _ in table_id_list
+        )
+
+        self.cursor.execute(
+            f"""
+            SELECT
+                SemanticColumnID,
+                SemanticTableID,
+                ColumnName,
+                DefinitionPath,
+                ColumnType,
+                IsHidden
+            FROM dbo.MetadataSemanticColumn
+            WHERE SemanticTableID IN ({placeholders})
+            """,
+            *table_id_list,
+        )
+
+        existing = {}
+
+        for (
+            column_id,
+            table_id,
+            column_name,
+            definition_path,
+            column_type,
+            is_hidden,
+        ) in self.cursor.fetchall():
+
+            existing[
+                (
+                    int(table_id),
+                    str(column_name).lower(),
+                )
+            ] = (
+                int(column_id),
+                definition_path,
+                column_type,
+                is_hidden,
+            )
+
+        incoming = {}
 
         for column in columns:
 
-            table_key = column[
-                "table_name"
-            ].lower()
-
-            semantic_table_id = (
-                table_ids.get(
-                    table_key
-                )
+            table_id = table_ids.get(
+                column["table_name"].lower()
             )
 
-            if not semantic_table_id:
+            if not table_id:
                 continue
 
+            incoming[
+                (
+                    table_id,
+                    column["column_name"].lower(),
+                )
+            ] = column
+
+        insert_rows = [
+            (key[0], column)
+            for key, column in incoming.items()
+            if key not in existing
+        ]
+
+        update_rows = [
+            (column, existing[key][0])
+            for key, column in incoming.items()
+            if key in existing
+            and (
+                existing[key][1] != column["definition_path"]
+                or existing[key][2] != column["column_type"]
+                or existing[key][3] != column["is_hidden"]
+            )
+        ]
+
+        removed_ids = [
+            row[0]
+            for key, row in existing.items()
+            if key not in incoming
+        ]
+
+        if removed_ids:
+
+            del_placeholders = ",".join(
+                "?" for _ in removed_ids
+            )
+
             self.cursor.execute(
+                f"""
+                DELETE FROM dbo.MetadataSemanticColumn
+                WHERE SemanticColumnID IN ({del_placeholders})
+                """,
+                *removed_ids,
+            )
+
+        if update_rows:
+
+            self.cursor.fast_executemany = True
+
+            self.cursor.executemany(
+                """
+                UPDATE dbo.MetadataSemanticColumn
+                SET
+                    DefinitionPath = ?,
+                    ColumnType = ?,
+                    IsHidden = ?
+                WHERE SemanticColumnID = ?
+                """,
+                [
+                    (
+                        column["definition_path"],
+                        column["column_type"],
+                        column["is_hidden"],
+                        column_id,
+                    )
+                    for column, column_id in update_rows
+                ],
+            )
+
+        if insert_rows:
+
+            self.cursor.fast_executemany = True
+
+            self.cursor.executemany(
                 """
                 INSERT INTO dbo.MetadataSemanticColumn
                 (
@@ -2395,54 +2765,261 @@ class MetadataRepositoryWriter:
                     ?, ?, ?, ?, ?
                 )
                 """,
-                semantic_table_id,
-                column[
-                    "column_name"
-                ],
-                column[
-                    "definition_path"
-                ],
-                column[
-                    "column_type"
-                ],
-                column[
-                    "is_hidden"
+                [
+                    (
+                        table_id,
+                        column["column_name"],
+                        column["definition_path"],
+                        column["column_type"],
+                        column["is_hidden"],
+                    )
+                    for table_id, column in insert_rows
                 ],
             )
 
-            self.cursor.execute(
-                """
-                SELECT
-                    SemanticColumnID
-                FROM dbo.MetadataSemanticColumn
-                WHERE SemanticTableID = ?
-                  AND ColumnName = ?
-                """,
-                semantic_table_id,
-                column[
-                    "column_name"
-                ],
+        # Single authoritative re-fetch of the current column ID map.
+        self.cursor.execute(
+            f"""
+            SELECT
+                SemanticColumnID,
+                SemanticTableID,
+                ColumnName
+            FROM dbo.MetadataSemanticColumn
+            WHERE SemanticTableID IN ({placeholders})
+            """,
+            *table_id_list,
+        )
+
+        table_id_to_name = {
+            table_id: table_name
+            for table_name, table_id in table_ids.items()
+        }
+
+        column_ids = {}
+
+        for (
+            column_id,
+            table_id,
+            column_name,
+        ) in self.cursor.fetchall():
+
+            table_name = table_id_to_name.get(
+                int(table_id)
             )
 
-            row = self.cursor.fetchone()
-
-            if not row:
+            if not table_name:
                 continue
 
             column_ids[
                 (
-                    column[
-                        "table_name"
-                    ].lower(),
-                    column[
-                        "column_name"
-                    ].lower(),
+                    table_name,
+                    str(column_name).lower(),
                 )
-            ] = int(
-                row[0]
-            )
+            ] = int(column_id)
 
         return column_ids
+
+    # ========================================================================
+    # SYNC MEASURES (incremental: insert new, update changed, delete removed)
+    # ========================================================================
+
+    def sync_measures(
+        self,
+        semantic_model_id,
+        table_ids,
+        measures,
+    ):
+
+        self.cursor.execute(
+            """
+            SELECT
+                MeasureID,
+                MeasureName,
+                SemanticTableID,
+                DAXExpression,
+                DefinitionPath,
+                IsHidden
+            FROM dbo.MetadataMeasure
+            WHERE SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
+
+        existing = {}
+
+        for (
+            measure_id,
+            measure_name,
+            table_id,
+            dax_expression,
+            definition_path,
+            is_hidden,
+        ) in self.cursor.fetchall():
+
+            # Keyed by (table_id, name) rather than name alone --
+            # measure names are not guaranteed unique across the
+            # whole model (e.g. the same name reused in a different
+            # table, or a genuine duplicate). Keying by name alone
+            # would collapse two distinct measures into one entry
+            # and silently drop a row.
+            existing[
+                (
+                    table_id,
+                    str(measure_name).lower(),
+                )
+            ] = (
+                int(measure_id),
+                dax_expression,
+                definition_path,
+                is_hidden,
+            )
+
+        incoming = {}
+
+        for measure in measures:
+
+            table_id = table_ids.get(
+                measure["table_name"].lower()
+            )
+
+            incoming[
+                (
+                    table_id,
+                    measure["measure_name"].lower(),
+                )
+            ] = measure
+
+        insert_rows = []
+        update_rows = []
+
+        for key, measure in incoming.items():
+
+            table_id = key[0]
+
+            existing_row = existing.get(key)
+
+            if existing_row is None:
+
+                insert_rows.append(
+                    (table_id, measure)
+                )
+
+            else:
+
+                (
+                    existing_id,
+                    existing_dax,
+                    existing_def_path,
+                    existing_hidden,
+                ) = existing_row
+
+                if (
+                    existing_dax != measure["expression"]
+                    or existing_def_path != measure["definition_path"]
+                    or existing_hidden != measure["is_hidden"]
+                ):
+
+                    update_rows.append(
+                        (table_id, measure, existing_id)
+                    )
+
+        removed_ids = [
+            row[0]
+            for key, row in existing.items()
+            if key not in incoming
+        ]
+
+        if removed_ids:
+
+            placeholders = ",".join(
+                "?" for _ in removed_ids
+            )
+
+            self.cursor.execute(
+                f"""
+                DELETE FROM dbo.MetadataMeasure
+                WHERE MeasureID IN ({placeholders})
+                """,
+                *removed_ids,
+            )
+
+        if update_rows:
+
+            self.cursor.fast_executemany = True
+
+            self.cursor.executemany(
+                """
+                UPDATE dbo.MetadataMeasure
+                SET
+                    SemanticTableID = ?,
+                    DAXExpression = ?,
+                    DefinitionPath = ?,
+                    IsHidden = ?
+                WHERE MeasureID = ?
+                """,
+                [
+                    (
+                        table_id,
+                        measure["expression"],
+                        measure["definition_path"],
+                        measure["is_hidden"],
+                        measure_id,
+                    )
+                    for table_id, measure, measure_id in update_rows
+                ],
+            )
+
+        if insert_rows:
+
+            self.cursor.fast_executemany = True
+
+            self.cursor.executemany(
+                """
+                INSERT INTO dbo.MetadataMeasure
+                (
+                    SemanticModelID,
+                    SemanticTableID,
+                    MeasureName,
+                    DAXExpression,
+                    DefinitionPath,
+                    IsHidden
+                )
+                VALUES
+                (
+                    ?, ?, ?, ?, ?, ?
+                )
+                """,
+                [
+                    (
+                        semantic_model_id,
+                        table_id,
+                        measure["measure_name"],
+                        measure["expression"],
+                        measure["definition_path"],
+                        measure["is_hidden"],
+                    )
+                    for table_id, measure in insert_rows
+                ],
+            )
+
+        # Single authoritative re-fetch of the current measure ID map.
+        self.cursor.execute(
+            """
+            SELECT
+                MeasureID,
+                MeasureName
+            FROM dbo.MetadataMeasure
+            WHERE SemanticModelID = ?
+            """,
+            semantic_model_id,
+        )
+
+        measure_ids = {
+            str(measure_name).lower(): int(measure_id)
+            for measure_id, measure_name in self.cursor.fetchall()
+        }
+
+        return measure_ids
 
     # ========================================================================
     # TABLE SOURCES
@@ -2462,6 +3039,12 @@ class MetadataRepositoryWriter:
             ].lower(): item
             for item in source_mappings
         }
+
+        # Collect rows first, then insert as one batch instead of
+        # one execute() call per table. This method never needs the
+        # generated identity back, so it's a pure insert-only loop
+        # and a good fit for executemany().
+        rows = []
 
         for table in tables:
 
@@ -2501,27 +3084,38 @@ class MetadataRepositoryWriter:
                 "table_id"
             ]
 
-            self.cursor.execute(
-                """
-                INSERT INTO dbo.MetadataSemanticTableSource
+            rows.append(
                 (
-                    SemanticTableID,
-                    TableID,
-                    ResolutionMethod,
-                    SourceExpression
+                    semantic_table_id,
+                    table_id,
+                    "SOURCE_MAPPING",
+                    mapping.get(
+                        "m_expression"
+                    ),
                 )
-                VALUES
-                (
-                    ?, ?, ?, ?
-                )
-                """,
-                semantic_table_id,
-                table_id,
-                "SOURCE_MAPPING",
-                mapping.get(
-                    "m_expression"
-                ),
             )
+
+        if not rows:
+            return
+
+        self.cursor.fast_executemany = True
+
+        self.cursor.executemany(
+            """
+            INSERT INTO dbo.MetadataSemanticTableSource
+            (
+                SemanticTableID,
+                TableID,
+                ResolutionMethod,
+                SourceExpression
+            )
+            VALUES
+            (
+                ?, ?, ?, ?
+            )
+            """,
+            rows,
+        )
 
     # ========================================================================
     # COLUMN SOURCES
@@ -2541,6 +3135,10 @@ class MetadataRepositoryWriter:
             ].lower(): item
             for item in source_mappings
         }
+
+        # Collect rows first, then insert as one batch. Same
+        # insert-only shape as insert_table_sources().
+        rows = []
 
         for column in columns:
 
@@ -2607,29 +3205,40 @@ class MetadataRepositoryWriter:
             if not physical:
                 continue
 
-            self.cursor.execute(
-                """
-                INSERT INTO dbo.MetadataSemanticColumnSource
+            rows.append(
                 (
-                    SemanticColumnID,
-                    ColumnID,
-                    ResolutionMethod,
-                    SourceExpression
+                    semantic_column_id,
+                    physical[
+                        "column_id"
+                    ],
+                    "POWER_QUERY_MAPPING",
+                    mapping.get(
+                        "m_expression"
+                    ),
                 )
-                VALUES
-                (
-                    ?, ?, ?, ?
-                )
-                """,
-                semantic_column_id,
-                physical[
-                    "column_id"
-                ],
-                "POWER_QUERY_MAPPING",
-                mapping.get(
-                    "m_expression"
-                ),
             )
+
+        if not rows:
+            return
+
+        self.cursor.fast_executemany = True
+
+        self.cursor.executemany(
+            """
+            INSERT INTO dbo.MetadataSemanticColumnSource
+            (
+                SemanticColumnID,
+                ColumnID,
+                ResolutionMethod,
+                SourceExpression
+            )
+            VALUES
+            (
+                ?, ?, ?, ?
+            )
+            """,
+            rows,
+        )
 
     # ========================================================================
     # COLUMN DEPENDENCIES
@@ -2640,6 +3249,10 @@ class MetadataRepositoryWriter:
         columns,
         column_ids,
     ):
+
+        # Collect rows first, then insert as one batch instead of
+        # one execute() call per dependency.
+        rows = []
 
         for column in columns:
 
@@ -2695,112 +3308,40 @@ class MetadataRepositoryWriter:
                     )
                 )
 
-                self.cursor.execute(
-                    """
-                    INSERT INTO dbo.MetadataSemanticColumnDependency
+                rows.append(
                     (
-                        SourceSemanticColumnID,
-                        TargetSemanticTableID,
-                        TargetSemanticColumnID,
-                        DependencyType,
-                        DependencyExpression
+                        source_id,
+                        target_table_id,
+                        target_column_id,
+                        "CALCULATED_COLUMN",
+                        column.get(
+                            "expression"
+                        ),
                     )
-                    VALUES
-                    (
-                        ?, ?, ?, ?, ?
-                    )
-                    """,
-                    source_id,
-                    target_table_id,
-                    target_column_id,
-                    "CALCULATED_COLUMN",
-                    column.get(
-                        "expression"
-                    ),
                 )
 
-    # ========================================================================
-    # MEASURES
-    # ========================================================================
+        if not rows:
+            return
 
-    def insert_measures(
-        self,
-        semantic_model_id,
-        table_ids,
-        measures,
-    ):
+        self.cursor.fast_executemany = True
 
-        measure_ids = {}
-
-        for measure in measures:
-
-            semantic_table_id = (
-                table_ids.get(
-                    measure[
-                        "table_name"
-                    ].lower()
-                )
+        self.cursor.executemany(
+            """
+            INSERT INTO dbo.MetadataSemanticColumnDependency
+            (
+                SourceSemanticColumnID,
+                TargetSemanticTableID,
+                TargetSemanticColumnID,
+                DependencyType,
+                DependencyExpression
             )
-
-            self.cursor.execute(
-                """
-                INSERT INTO dbo.MetadataMeasure
-                (
-                    SemanticModelID,
-                    SemanticTableID,
-                    MeasureName,
-                    DAXExpression,
-                    DefinitionPath,
-                    IsHidden
-                )
-                VALUES
-                (
-                    ?, ?, ?, ?, ?, ?
-                )
-                """,
-                semantic_model_id,
-                semantic_table_id,
-                measure[
-                    "measure_name"
-                ],
-                measure[
-                    "expression"
-                ],
-                measure[
-                    "definition_path"
-                ],
-                measure[
-                    "is_hidden"
-                ],
+            VALUES
+            (
+                ?, ?, ?, ?, ?
             )
-
-            self.cursor.execute(
-                """
-                SELECT
-                    MeasureID
-                FROM dbo.MetadataMeasure
-                WHERE SemanticModelID = ?
-                  AND MeasureName = ?
-                """,
-                semantic_model_id,
-                measure[
-                    "measure_name"
-                ],
-            )
-
-            row = self.cursor.fetchone()
-
-            if row:
-
-                measure_ids[
-                    measure[
-                        "measure_name"
-                    ].lower()
-                ] = int(
-                    row[0]
-                )
-
-        return measure_ids
+            """,
+            rows,
+        )
 
     # ========================================================================
     # MEASURE DEPENDENCIES
@@ -2813,6 +3354,10 @@ class MetadataRepositoryWriter:
         table_ids,
         column_ids,
     ):
+
+        # Collect rows first, then insert as one batch instead of
+        # one execute() call per dependency.
+        rows = []
 
         for measure in measures:
 
@@ -2859,30 +3404,17 @@ class MetadataRepositoryWriter:
                     )
                 )
 
-                self.cursor.execute(
-                    """
-                    INSERT INTO dbo.MetadataMeasureDependency
+                rows.append(
                     (
-                        MeasureID,
-                        SemanticTableID,
-                        SemanticColumnID,
-                        MeasureDependencyID,
-                        DependencyType,
-                        DependencyExpression
+                        measure_id,
+                        target_table_id,
+                        target_column_id,
+                        None,
+                        "DAX_COLUMN",
+                        measure[
+                            "expression"
+                        ],
                     )
-                    VALUES
-                    (
-                        ?, ?, ?, ?, ?, ?
-                    )
-                    """,
-                    measure_id,
-                    target_table_id,
-                    target_column_id,
-                    None,
-                    "DAX_COLUMN",
-                    measure[
-                        "expression"
-                    ],
                 )
 
             for measure_reference in dependencies[
@@ -2895,31 +3427,42 @@ class MetadataRepositoryWriter:
                     )
                 )
 
-                self.cursor.execute(
-                    """
-                    INSERT INTO dbo.MetadataMeasureDependency
+                rows.append(
                     (
-                        MeasureID,
-                        SemanticTableID,
-                        SemanticColumnID,
-                        MeasureDependencyID,
-                        DependencyType,
-                        DependencyExpression
+                        measure_id,
+                        None,
+                        None,
+                        target_measure_id,
+                        "DAX_MEASURE",
+                        measure[
+                            "expression"
+                        ],
                     )
-                    VALUES
-                    (
-                        ?, ?, ?, ?, ?, ?
-                    )
-                    """,
-                    measure_id,
-                    None,
-                    None,
-                    target_measure_id,
-                    "DAX_MEASURE",
-                    measure[
-                        "expression"
-                    ],
                 )
+
+        if not rows:
+            return
+
+        self.cursor.fast_executemany = True
+
+        self.cursor.executemany(
+            """
+            INSERT INTO dbo.MetadataMeasureDependency
+            (
+                MeasureID,
+                SemanticTableID,
+                SemanticColumnID,
+                MeasureDependencyID,
+                DependencyType,
+                DependencyExpression
+            )
+            VALUES
+            (
+                ?, ?, ?, ?, ?, ?
+            )
+            """,
+            rows,
+        )
 
     # ========================================================================
     # TABLE DEPENDENCIES
@@ -2931,6 +3474,10 @@ class MetadataRepositoryWriter:
         table_ids,
         column_ids,
     ):
+
+        # Collect rows first, then insert as one batch instead of
+        # one execute() call per dependency.
+        rows = []
 
         for table in calculated_tables:
 
@@ -2975,29 +3522,40 @@ class MetadataRepositoryWriter:
                     )
                 )
 
-                self.cursor.execute(
-                    """
-                    INSERT INTO dbo.MetadataSemanticTableDependency
+                rows.append(
                     (
-                        SemanticTableID,
-                        TargetSemanticTableID,
-                        TargetSemanticColumnID,
-                        DependencyType,
-                        DependencyExpression
+                        source_table_id,
+                        target_table_id,
+                        target_column_id,
+                        "CALCULATED_TABLE",
+                        table[
+                            "expression"
+                        ],
                     )
-                    VALUES
-                    (
-                        ?, ?, ?, ?, ?
-                    )
-                    """,
-                    source_table_id,
-                    target_table_id,
-                    target_column_id,
-                    "CALCULATED_TABLE",
-                    table[
-                        "expression"
-                    ],
                 )
+
+        if not rows:
+            return
+
+        self.cursor.fast_executemany = True
+
+        self.cursor.executemany(
+            """
+            INSERT INTO dbo.MetadataSemanticTableDependency
+            (
+                SemanticTableID,
+                TargetSemanticTableID,
+                TargetSemanticColumnID,
+                DependencyType,
+                DependencyExpression
+            )
+            VALUES
+            (
+                ?, ?, ?, ?, ?
+            )
+            """,
+            rows,
+        )
 
     # ========================================================================
     # RELATIONSHIPS
@@ -3010,6 +3568,10 @@ class MetadataRepositoryWriter:
         column_ids,
         relationships,
     ):
+
+        # Collect rows first, then insert as one batch instead of
+        # one execute() call per relationship.
+        rows = []
 
         for relationship in relationships:
 
@@ -3065,27 +3627,38 @@ class MetadataRepositoryWriter:
             ):
                 continue
 
-            self.cursor.execute(
-                """
-                INSERT INTO dbo.MetadataSemanticRelationship
+            rows.append(
                 (
-                    SemanticModelID,
-                    FromTableID,
-                    FromColumnID,
-                    ToTableID,
-                    ToColumnID
+                    semantic_model_id,
+                    from_table_id,
+                    from_column_id,
+                    to_table_id,
+                    to_column_id,
                 )
-                VALUES
-                (
-                    ?, ?, ?, ?, ?
-                )
-                """,
-                semantic_model_id,
-                from_table_id,
-                from_column_id,
-                to_table_id,
-                to_column_id,
             )
+
+        if not rows:
+            return
+
+        self.cursor.fast_executemany = True
+
+        self.cursor.executemany(
+            """
+            INSERT INTO dbo.MetadataSemanticRelationship
+            (
+                SemanticModelID,
+                FromTableID,
+                FromColumnID,
+                ToTableID,
+                ToColumnID
+            )
+            VALUES
+            (
+                ?, ?, ?, ?, ?
+            )
+            """,
+            rows,
+        )
 
     # ========================================================================
     # PHYSICAL TABLE RESOLUTION
@@ -3186,13 +3759,14 @@ class MetadataRepositoryWriter:
         ):
             return None
 
+        # Uses the cached lookup populated by
+        # load_source_metadata() -- no database round trip.
         column_id = (
-            MetadataRepositoryWriter
-            ._find_physical_column_id(
-                repository_validator,
-                physical_table[
-                    "table_id"
-                ],
+            repository_validator.find_column_id(
+                server,
+                database,
+                schema,
+                source_table,
                 physical_column,
             )
         )
@@ -3209,38 +3783,6 @@ class MetadataRepositoryWriter:
             "column_id":
                 column_id,
         }
-
-    @staticmethod
-    def _find_physical_column_id(
-        repository_validator,
-        table_id,
-        column_name,
-    ):
-
-        cursor = (
-            repository_validator.cursor
-        )
-
-        cursor.execute(
-            """
-            SELECT
-                ColumnID
-            FROM dbo.MetadataColumn
-            WHERE TableID = ?
-              AND LOWER(ColumnName) = LOWER(?)
-            """,
-            table_id,
-            column_name,
-        )
-
-        row = cursor.fetchone()
-
-        if not row:
-            return None
-
-        return int(
-            row[0]
-        )
 
     # ========================================================================
     # LOOKUPS
@@ -3479,30 +4021,34 @@ def process_semantic_model(
         )
 
         # --------------------------------------------------------------------
-        # Rebuild children
+        # Clear derived metadata only (relationships, dependencies,
+        # source mappings). Tables, columns, and measures are
+        # handled incrementally below by the sync_* methods instead
+        # of being wiped and reinserted every run.
         # --------------------------------------------------------------------
 
-        repository_writer.clear_model_metadata(
+        repository_writer.clear_derived_metadata(
             semantic_model_id
         )
 
         # --------------------------------------------------------------------
-        # Tables
+        # Tables (incremental sync: insert new, update changed,
+        # delete removed -- unchanged tables are left untouched)
         # --------------------------------------------------------------------
 
         table_ids = (
-            repository_writer.insert_tables(
+            repository_writer.sync_tables(
                 semantic_model_id,
                 tables,
             )
         )
 
         # --------------------------------------------------------------------
-        # Columns
+        # Columns (incremental sync)
         # --------------------------------------------------------------------
 
         column_ids = (
-            repository_writer.insert_columns(
+            repository_writer.sync_columns(
                 table_ids,
                 columns,
             )
@@ -3540,11 +4086,11 @@ def process_semantic_model(
         )
 
         # --------------------------------------------------------------------
-        # Measures
+        # Measures (incremental sync)
         # --------------------------------------------------------------------
 
         measure_ids = (
-            repository_writer.insert_measures(
+            repository_writer.sync_measures(
                 semantic_model_id,
                 table_ids,
                 measures,
@@ -4004,6 +4550,27 @@ def main():
             total_models_discovered += (
                 len(semantic_models)
             )
+
+            deleted_models = (
+                repository_writer.reconcile_deleted_models(
+                    workspace_id,
+                    [
+                        model.get("id")
+                        for model in semantic_models
+                        if model.get("id")
+                    ],
+                )
+            )
+
+            connection.commit()
+
+            if deleted_models:
+
+                logging.info(
+                    "Removed %d deleted semantic models from workspace '%s'.",
+                    deleted_models,
+                    workspace_name,
+                )
 
             if not semantic_models:
 
