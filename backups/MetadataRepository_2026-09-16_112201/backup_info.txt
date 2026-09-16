@@ -1,0 +1,39 @@
+MetadataRepository Backup
+============================================================
+
+Backup started:  2026-09-16T11:22:01.785083
+Backup finished: 2026-09-16T11:22:52.868858
+Duration:        0:00:51.083775
+
+Server:          j7mjaqg22d2ujb27llpciiyism-7jnw46tiqcde5cpv233ctk345u.datawarehouse.fabric.microsoft.com
+Database:        MetadataRepository
+
+Tables discovered: 22
+Tables successful: 22
+Tables failed:     0
+Total rows:        8,719
+
+Table results
+------------------------------------------------------------
+dbo.MetadataColumn | Rows: 752 | SUCCESS | MetadataColumn.csv
+dbo.MetadataDatabase | Rows: 1 | SUCCESS | MetadataDatabase.csv
+dbo.MetadataLineage | Rows: 1,761 | SUCCESS | MetadataLineage.csv
+dbo.MetadataMeasure | Rows: 343 | SUCCESS | MetadataMeasure.csv
+dbo.MetadataMeasureDependency | Rows: 540 | SUCCESS | MetadataMeasureDependency.csv
+dbo.MetadataRelationship | Rows: 90 | SUCCESS | MetadataRelationship.csv
+dbo.MetadataRelationshipColumn | Rows: 91 | SUCCESS | MetadataRelationshipColumn.csv
+dbo.MetadataReport | Rows: 9 | SUCCESS | MetadataReport.csv
+dbo.MetadataReportPage | Rows: 43 | SUCCESS | MetadataReportPage.csv
+dbo.MetadataReportVisual | Rows: 987 | SUCCESS | MetadataReportVisual.csv
+dbo.MetadataReportVisualField | Rows: 722 | SUCCESS | MetadataReportVisualField.csv
+dbo.MetadataReportVisualFilter | Rows: 232 | SUCCESS | MetadataReportVisualFilter.csv
+dbo.MetadataSemanticColumn | Rows: 2,434 | SUCCESS | MetadataSemanticColumn.csv
+dbo.MetadataSemanticColumnDependency | Rows: 5 | SUCCESS | MetadataSemanticColumnDependency.csv
+dbo.MetadataSemanticColumnSource | Rows: 149 | SUCCESS | MetadataSemanticColumnSource.csv
+dbo.MetadataSemanticModel | Rows: 9 | SUCCESS | MetadataSemanticModel.csv
+dbo.MetadataSemanticRelationship | Rows: 196 | SUCCESS | MetadataSemanticRelationship.csv
+dbo.MetadataSemanticTable | Rows: 243 | SUCCESS | MetadataSemanticTable.csv
+dbo.MetadataSemanticTableDependency | Rows: 3 | SUCCESS | MetadataSemanticTableDependency.csv
+dbo.MetadataSemanticTableSource | Rows: 15 | SUCCESS | MetadataSemanticTableSource.csv
+dbo.MetadataTable | Rows: 92 | SUCCESS | MetadataTable.csv
+dbo.MetadataWorkspace | Rows: 2 | SUCCESS | MetadataWorkspace.csv

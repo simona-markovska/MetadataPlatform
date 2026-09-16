@@ -59,3 +59,6 @@ desktop.ini
 # ============================================================
 tests/
 V6/
+
+# Metadata repository backup data
+backups/*/data/
