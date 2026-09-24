@@ -1355,15 +1355,19 @@ class MetadataRepository:
         model_name: str | None = None,
     ) -> dict[str, Any]:
         """
-        Find measures that are not used by any report visual
-        or visual-level filter.
+        Find measures that are not referenced by:
+        - any report visual,
+        - any report visual filter, or
+        - any other measure.
+
+        If model_name is supplied, restrict the analysis
+        to that semantic model.
         """
 
         if model_name:
 
             unused_sql = """
                 SELECT
-
                     m.MeasureID,
                     m.MeasureName,
                     m.DAXExpression,
@@ -1378,19 +1382,24 @@ class MetadataRepository:
 
                 INNER JOIN dbo.MetadataSemanticModel sm
                     ON m.SemanticModelID =
-                       sm.SemanticModelID
+                    sm.SemanticModelID
 
                 LEFT JOIN dbo.MetadataSemanticTable st
                     ON m.SemanticTableID =
-                       st.SemanticTableID
+                    st.SemanticTableID
 
                 LEFT JOIN dbo.MetadataReportVisualField vf
                     ON m.MeasureID =
-                       vf.MeasureID
+                    vf.MeasureID
 
                 LEFT JOIN dbo.MetadataReportVisualFilter vfilter
                     ON m.MeasureID =
-                       vfilter.MeasureID
+                    vfilter.MeasureID
+
+                LEFT JOIN dbo.MetadataMeasureDependency md
+                    ON m.MeasureID =
+                    md.MeasureDependencyID
+                    AND md.DependencyType = 'DAX_MEASURE'
 
                 WHERE sm.ModelName = ?
 
@@ -1405,6 +1414,7 @@ class MetadataRepository:
                 HAVING
                     COUNT(DISTINCT vf.VisualFieldID) = 0
                     AND COUNT(DISTINCT vfilter.VisualFilterID) = 0
+                    AND COUNT(DISTINCT md.DependencyID) = 0
 
                 ORDER BY
                     m.MeasureName
@@ -1423,7 +1433,7 @@ class MetadataRepository:
 
                 INNER JOIN dbo.MetadataSemanticModel sm
                     ON m.SemanticModelID =
-                       sm.SemanticModelID
+                    sm.SemanticModelID
 
                 WHERE sm.ModelName = ?
             """
@@ -1437,7 +1447,6 @@ class MetadataRepository:
 
             unused_sql = """
                 SELECT
-
                     m.MeasureID,
                     m.MeasureName,
                     m.DAXExpression,
@@ -1452,19 +1461,24 @@ class MetadataRepository:
 
                 INNER JOIN dbo.MetadataSemanticModel sm
                     ON m.SemanticModelID =
-                       sm.SemanticModelID
+                    sm.SemanticModelID
 
                 LEFT JOIN dbo.MetadataSemanticTable st
                     ON m.SemanticTableID =
-                       st.SemanticTableID
+                    st.SemanticTableID
 
                 LEFT JOIN dbo.MetadataReportVisualField vf
                     ON m.MeasureID =
-                       vf.MeasureID
+                    vf.MeasureID
 
                 LEFT JOIN dbo.MetadataReportVisualFilter vfilter
                     ON m.MeasureID =
-                       vfilter.MeasureID
+                    vfilter.MeasureID
+
+                LEFT JOIN dbo.MetadataMeasureDependency md
+                    ON m.MeasureID =
+                    md.MeasureDependencyID
+                    AND md.DependencyType = 'DAX_MEASURE'
 
                 GROUP BY
                     m.MeasureID,
@@ -1477,6 +1491,7 @@ class MetadataRepository:
                 HAVING
                     COUNT(DISTINCT vf.VisualFieldID) = 0
                     AND COUNT(DISTINCT vfilter.VisualFilterID) = 0
+                    AND COUNT(DISTINCT md.DependencyID) = 0
 
                 ORDER BY
                     sm.ModelName,
@@ -1504,23 +1519,36 @@ class MetadataRepository:
             else 0
         )
 
-        used_measures = (
+        not_referenced_count = len(unused)
+
+        referenced_measures = (
             total_measures -
-            len(unused)
+            not_referenced_count
         )
 
         return {
             "total_measures": total_measures,
 
-            "used_measures": used_measures,
+            "referenced_measures":
+                referenced_measures,
 
-            "unused_measure_count": len(unused),
+            "not_referenced_measure_count":
+                not_referenced_count,
 
-            "unused_measures": unused,
+            "not_referenced_measures":
+                unused,
+
+            # Keep these temporarily for backward compatibility
+            "unused_measure_count":
+                not_referenced_count,
+
+            "unused_measures":
+                unused,
 
             "summary": (
-                f"{len(unused)} out of "
-                f"{total_measures} measures "
-                f"are unused."
+                f"{not_referenced_count} out of "
+                f"{total_measures} measures are not "
+                f"referenced by visuals, filters, or "
+                f"other measures."
             ),
         }

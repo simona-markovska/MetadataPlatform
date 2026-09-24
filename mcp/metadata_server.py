@@ -87,6 +87,10 @@ from src.services.lineage_service import LineageService
 from src.services.impact_analysis_service import ImpactAnalysisService
 from src.services.report_analysis_service import ReportAnalysisService
 from src.services.extraction_service import ExtractionService
+from src.services.extraction_monitor_service import (
+    ExtractionMonitorService,
+)
+
 
 
 # ============================================================================
@@ -147,6 +151,10 @@ report_service = ReportAnalysisService(
 )
 
 extraction_service = ExtractionService()
+
+extraction_monitor_service = ExtractionMonitorService(
+    extraction_service
+)
 
 
 # ============================================================================
@@ -511,6 +519,71 @@ def run_full_metadata_refresh() -> dict[str, Any]:
     """
     return extraction_service.run_full_metadata_refresh()
 
+# ============================================================================
+# TOOL 18 - MONITOR SQL EXTRACTION
+# ============================================================================
+
+@mcp.tool()
+def monitor_sql_extraction(job_id: str) -> dict[str, Any]:
+    """
+    Check the current status of an already-started SQL metadata
+    extraction job.
+
+    Requires the job ID returned by start_sql_extraction.
+    Performs one status check and returns immediately.
+    """
+    return extraction_monitor_service.monitor_sql_extraction(job_id)
+
+
+
+# ============================================================================
+# TOOL 19 - MONITOR SEMANTIC MODEL EXTRACTION
+# ============================================================================
+
+@mcp.tool()
+def monitor_semantic_model_extraction(job_id: str) -> dict[str, Any]:
+    """
+    Check the current status of an already-started semantic model
+    extraction job.
+
+    Requires the job ID returned by start_semantic_model_extraction.
+    Performs one status check and returns immediately.
+    """
+    return extraction_monitor_service.monitor_semantic_model_extraction(
+        job_id
+    )
+
+
+# ============================================================================
+# TOOL 20 - MONITOR REPORT EXTRACTION
+# ============================================================================
+
+@mcp.tool()
+def monitor_report_extraction(job_id: str) -> dict[str, Any]:
+    """
+    Check the current status of an already-started report extraction job.
+
+    Requires the job ID returned by start_report_extraction.
+    Performs one status check and returns immediately.
+    """
+    return extraction_monitor_service.monitor_report_extraction(job_id)
+
+
+# ============================================================================
+# TOOL 21 - MONITOR FULL METADATA REFRESH
+# ============================================================================
+
+@mcp.tool()
+def monitor_full_metadata_refresh(job_id: str) -> dict[str, Any]:
+    """
+    Check the current status of an already-started full metadata refresh.
+
+    Requires the job ID returned by run_full_metadata_refresh.
+    Performs one status check and returns immediately.
+    """
+    return extraction_monitor_service.monitor_full_metadata_refresh(
+        job_id
+    )
 
 # ============================================================================
 # SERVER START
@@ -604,7 +677,7 @@ if __name__ == "__main__":
     )
 
     logger.info(
-        "  [WRITES TO METADATAREPOSITORY]"
+    "  [WRITES TO METADATAREPOSITORY]"
     )
 
     logger.info(
@@ -629,6 +702,26 @@ if __name__ == "__main__":
 
     logger.info(
         "  - run_full_metadata_refresh"
+    )
+
+    logger.info(
+        "  [MONITORED EXTRACTION WORKFLOWS]"
+    )
+
+    logger.info(
+        "  - monitor_sql_extraction"
+    )
+
+    logger.info(
+        "  - monitor_semantic_model_extraction"
+    )
+
+    logger.info(
+        "  - monitor_report_extraction"
+    )
+
+    logger.info(
+        "  - monitor_full_metadata_refresh"
     )
 
     mcp.run(
